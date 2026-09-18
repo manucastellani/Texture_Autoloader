@@ -150,6 +150,15 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "Suffix convention used to recognize each map. Add your own under "
             "\"naming_presets\" in texture_autoloader_config.json."),
         "preset_default": "Default (config file)",
+        # ── Settings: render engine (Maya) ──
+        "render_engine_label": "RENDER ENGINE",
+        "render_engine_title": "Render engine",
+        "render_engine_tooltip": (
+            "Shader created for each object. Redshift and V-Ray need their plugin loaded."),
+        "msg_engine_plugin_not_loaded": (
+            "{engine} needs the '{plugin}' plugin, which isn't loaded.\n\nLoad it now?"),
+        "msg_engine_plugin_load_failed": "Could not load '{plugin}': {error}",
+        "report_reason_missing_attr": "{target} has no '{attr}' attribute (other renderer version?)",
     },
     "es": {
         "app_title": "TEXTURE AUTOLOADER",
@@ -246,6 +255,15 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "Convención de sufijos para reconocer cada mapa. Sumá la tuya en "
             "\"naming_presets\" dentro de texture_autoloader_config.json."),
         "preset_default": "Por defecto (archivo de config)",
+        # ── Configuración: motor de render (Maya) ──
+        "render_engine_label": "MOTOR DE RENDER",
+        "render_engine_title": "Motor de render",
+        "render_engine_tooltip": (
+            "Shader que se crea para cada objeto. Redshift y V-Ray necesitan su plugin cargado."),
+        "msg_engine_plugin_not_loaded": (
+            "{engine} necesita el plugin '{plugin}', que no está cargado.\n\n¿Cargarlo ahora?"),
+        "msg_engine_plugin_load_failed": "No se pudo cargar '{plugin}': {error}",
+        "report_reason_missing_attr": "{target} no tiene el atributo '{attr}' (¿otra versión del renderer?)",
     },
 }
 

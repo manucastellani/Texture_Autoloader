@@ -200,6 +200,35 @@ def _run_checks(cmds, app, tmp):
         check(bump is not None and cmds.nodeType(bump) == "bump2d",
               "...Hero_N.png goes through a bump2d", failures)
 
+    # ── Render engines ──────────────────────────────────────────
+    check(ta.engine_plugin_loaded("arnold"), "Arnold counts as loaded", failures)
+    if not ta.engine_plugin_loaded("redshift"):
+        try:
+            ta.process_textures(None, rock, mat_basename="Rock", config=config,
+                                channel_files={"baseColor": os.path.join(tex_dir, "Rock_BaseColor.png")},
+                                engine="redshift")
+            check(False, "Redshift without its plugin raises a clear error", failures)
+        except RuntimeError as e:
+            check("redshift4maya" in str(e), f"Redshift without its plugin raises: {e}", failures)
+
+    # Opt-in displacement, for real: luminance into a displacementShader on the SG.
+    cliff = cmds.polyCube(name="SM_Cliff")[0]
+    write_png(os.path.join(tex_dir, "Cliff_BaseColor.png"))
+    write_png(os.path.join(tex_dir, "Cliff_Height.png"))
+    disp_config = dict(config, enable_displacement_wiring=True)
+    cliff_matches = ta.match_objects_to_textures([cliff], ta.scan_folder(tex_dir, disp_config),
+                                                 disp_config)
+    ta.apply_auto_textures(cliff_matches, disp_config, engine="arnold")
+    shader = ta._find_autoloader_shader(cliff)
+    sg = (cmds.listConnections(f"{shader}.outColor", type="shadingEngine") or [None])[0]
+    disp = source_node(cmds, f"{sg}.displacementShader") if sg else None
+    check(disp is not None and cmds.nodeType(disp) == "displacementShader",
+          "with enable_displacement_wiring, a displacementShader feeds the shading group", failures)
+    if disp:
+        height_file = source_node(cmds, f"{disp}.displacement")
+        check(height_file is not None and cmds.getAttr(f"{height_file}.alphaIsLuminance"),
+              "...reading the height map's luminance (alphaIsLuminance)", failures)
+
     # ── Qt dialog smoke test (offscreen) ────────────────────────
     # Builds the real dialog and drives a few handlers: catches typos and
     # missing widgets in UI code that no other test executes.
@@ -218,6 +247,12 @@ def _run_checks(cmds, app, tmp):
           f"picking short_suffixes re-scans into one set (sets: {sorted(dlg.tex_map)})", failures)
     check(ta.core.load_state(ta._app_dir()).get("last_naming_preset") == "short_suffixes",
           "the chosen preset is remembered in the state file", failures)
+    engines = [dlg.combo_render_engine.itemData(i) for i in range(dlg.combo_render_engine.count())]
+    check(engines == ["arnold", "redshift", "vray"], f"dialog lists the render engines ({engines})",
+          failures)
+    dlg._on_render_engine_activated(dlg.combo_render_engine.findData("vray"))
+    check(ta.core.load_state(ta._app_dir()).get("last_render_engine") == "vray",
+          "the chosen render engine is remembered in the state file", failures)
     dlg.close()
     app.processEvents()
 
