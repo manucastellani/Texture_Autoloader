@@ -6,11 +6,12 @@ Author: Manuel Castellani
 This module contains every part of Texture Autoloader that does NOT
 depend on Maya, Blender, or any specific UI toolkit: string/name
 normalization, fuzzy matching, UDIM collapsing, map-type bucketing,
-config/state persistence and logging. Both `maya/texture_autoloader_maya.py`
-and `blender/texture_autoloader_blender.py` import this module and only
+config/state persistence and logging. `maya/texture_autoloader_maya.py`,
+`blender/texture_autoloader_blender.py` and the Unreal port
+(`../../unreal/texture_autoloader_unreal.py`) import this module and only
 add the pieces that are genuinely specific to their host application: the
-actual shading-node wiring (aiStandardSurface vs. Principled BSDF) and the
-UI framework (Qt vs. Blender's own).
+actual shading work (node wiring per render engine, a Principled BSDF
+graph, or Material Instance parameters in Unreal) and the UI framework.
 
 Design rule enforced throughout this file: nothing in here imports
 `maya`, `bpy`, `PySide`, or any GUI library. Anything that needs to know
@@ -26,7 +27,14 @@ que vivía como una única herramienta de Maya llamada "Arnold Node
 Wrangler"; ver maya/texture_autoloader_maya.py para el detalle completo
 de las versiones v1 a v4.1 previas al split multi-DCC):
 
-  - v5.0 (este release): split en core (DCC-agnostic) + maya + blender.
+  - v5.1 (dcc_mejoras, en pruebas): reporte ✔/✘ compartido
+    (build_report), presets de naming (naming_presets /
+    apply_naming_preset, con sufijos anclados al final del nombre),
+    matching por nombres candidatos (match_names_to_textures, lo usa el
+    port a Unreal para los Material Slots) y load_config con defaults
+    propios de cada front-end. Fixes: tiles UDIM "Name.1001.png" partidos
+    en sets distintos; un .log vacío creado antes del primer mensaje.
+  - v5.0: split en core (DCC-agnostic) + maya + blender.
     Renombrado de "Arnold Node Wrangler" a "Texture Autoloader" (nombre
     más claro sobre qué hace la herramienta y ya no atado a un único
     renderer). UI bilingüe (EN/ES) con botón de idioma. Logging
