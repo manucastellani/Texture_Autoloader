@@ -87,8 +87,15 @@ def check(condition, message, failures):
 
 
 def run():
-    failures = []
     tmp = tempfile.mkdtemp(prefix="tal_blender_")
+    try:
+        _run_checks(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_checks(tmp):
+    failures = []
     tex_dir = os.path.join(tmp, "textures")
     os.makedirs(tex_dir)
     make_textures(tex_dir)
@@ -168,6 +175,30 @@ def run():
         check(expected in report, f"report says: {expected}", failures)
     if failures:
         print("\n--- report ---\n" + report + "\n--------------")
+
+    # ── Naming preset with short suffixes (_BC / _N / _R) ───────
+    short_dir = os.path.join(tmp, "short")
+    os.makedirs(short_dir)
+    for name in ("Hero_BC.png", "Hero_N.png", "Hero_R.png"):
+        write_png(os.path.join(short_dir, name))
+    hero = make_mesh("SM_Hero")
+    for obj in bpy.context.scene.objects:
+        obj.select_set(obj is hero)
+    props.folder = short_dir
+    props.naming_preset = "short_suffixes"  # re-scans the folder on its own
+    bpy.ops.texture_autoloader.smart_match()
+    bpy.ops.texture_autoloader.apply_all()
+    mat = hero.material_slots[0].material if hero.material_slots else None
+    check(mat is not None, "short_suffixes preset: SM_Hero got a material", failures)
+    if mat:
+        bsdf = next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+        for socket, expected in (("Base Color", "Hero_BC.png"), ("Roughness", "Hero_R.png")):
+            src = linked_from(bsdf.inputs[socket])
+            got = os.path.basename(src[0].node.image.filepath) if src else None
+            check(got == expected, f"...{expected} feeds {socket} (got {got})", failures)
+        normal_src = linked_from(bsdf.inputs["Normal"])
+        check(bool(normal_src) and normal_src[0].node.type == "NORMAL_MAP",
+              "...Hero_N.png goes through a Normal Map node", failures)
 
     print()
     if failures:

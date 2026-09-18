@@ -143,6 +143,13 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "done_body_report_hint": "Full report under “Show Details…” and in the Script Editor.",
         "btn_show_report": "SHOW LAST REPORT",
         "report_in_text_editor": "Full report in the Text Editor: “{name}”",
+        # ── Settings: naming presets ──
+        "section_settings": "SETTINGS",
+        "naming_preset_label": "NAMING PRESET",
+        "naming_preset_tooltip": (
+            "Suffix convention used to recognize each map. Add your own under "
+            "\"naming_presets\" in texture_autoloader_config.json."),
+        "preset_default": "Default (config file)",
     },
     "es": {
         "app_title": "TEXTURE AUTOLOADER",
@@ -232,6 +239,13 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "done_body_report_hint": "Reporte completo en “Show Details…” y en el Script Editor.",
         "btn_show_report": "VER ÚLTIMO REPORTE",
         "report_in_text_editor": "Reporte completo en el Text Editor: “{name}”",
+        # ── Configuración: presets de nombres ──
+        "section_settings": "CONFIGURACIÓN",
+        "naming_preset_label": "PRESET DE NOMBRES",
+        "naming_preset_tooltip": (
+            "Convención de sufijos para reconocer cada mapa. Sumá la tuya en "
+            "\"naming_presets\" dentro de texture_autoloader_config.json."),
+        "preset_default": "Por defecto (archivo de config)",
     },
 }
 
@@ -325,6 +339,30 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         {"id": "opacity", "match": ["_opacity", "_alpha", "_mask"],
          "color_space": "Raw", "raw": True},
     ],
+    # Naming presets: named conventions to pick from in the UI instead of
+    # editing map_types by hand. "default" always exists and IS the
+    # map_types / suffix_strip_list above (a config customized the old way
+    # keeps working as-is). In a preset, each channel lists "suffixes":
+    # what the file name ENDS with, before resolution/UDIM tags — "BC"
+    # matches Rock_BC.png, Rock_BC_4k.png and Rock_BC.1001.png, but not
+    # Car_Rim_BC... as roughness just because it contains "_R". Color
+    # space / raw are optional (sensible defaults per channel).
+    "naming_preset": "default",
+    "naming_presets": {
+        "short_suffixes": {
+            "label": "Short suffixes (_BC _N _R _M _AO _E _H _O)",
+            "map_types": [
+                {"id": "baseColor", "suffixes": ["BC", "Albedo", "D"]},
+                {"id": "normal", "suffixes": ["N", "NRM"]},
+                {"id": "roughness", "suffixes": ["R", "Rough"]},
+                {"id": "metallic", "suffixes": ["M", "Metal"]},
+                {"id": "ao", "suffixes": ["AO"]},
+                {"id": "emission", "suffixes": ["E", "Emissive"]},
+                {"id": "displacement", "suffixes": ["H", "Height", "Disp"]},
+                {"id": "opacity", "suffixes": ["O", "Opacity", "Alpha"]},
+            ],
+        },
+    },
 }
 
 
@@ -336,23 +374,90 @@ def deep_merge_defaults(loaded: Dict[str, Any], defaults: Dict[str, Any]) -> Dic
     return merged
 
 
-def load_config(app_dir: str, warn_fn: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+def load_config(app_dir: str, warn_fn: Optional[Callable[[str], None]] = None,
+                defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """`defaults` lets a front-end add keys of its own (e.g. Maya's render
+    engine, Unreal's master material) on top of DEFAULT_CONFIG without the
+    core — or the other front-ends' config files — having to know them."""
+    defaults = defaults or DEFAULT_CONFIG
     path = os.path.join(app_dir, CONFIG_FILENAME)
     if not os.path.exists(path):
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+                json.dump(defaults, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
-        return dict(DEFAULT_CONFIG)
+        return dict(defaults)
     try:
         with open(path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-        return deep_merge_defaults(loaded, DEFAULT_CONFIG)
+        return deep_merge_defaults(loaded, defaults)
     except Exception as e:
         if warn_fn:
             warn_fn(f"[TextureAutoloader] Could not read {path} ({e}) — using default config.")
-        return dict(DEFAULT_CONFIG)
+        return dict(defaults)
+
+
+# ══════════════════════════════════════════════════════════════
+#  NAMING PRESETS — convenciones de sufijos con nombre, elegibles
+#  desde la UI (ver "naming_presets" en DEFAULT_CONFIG).
+# ══════════════════════════════════════════════════════════════
+
+DEFAULT_PRESET_ID = "default"
+
+# Color space / raw per channel, for presets that only list suffixes.
+_MAP_TYPE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    mt["id"]: {"color_space": mt["color_space"], "raw": mt["raw"]}
+    for mt in DEFAULT_CONFIG["map_types"]
+}
+
+
+def list_naming_presets(config: Dict[str, Any],
+                        language: str = DEFAULT_LANGUAGE) -> List[Tuple[str, str]]:
+    """[(preset_id, label)], "default" first."""
+    presets = [(DEFAULT_PRESET_ID, tr(language, "preset_default"))]
+    for preset_id, preset in (config.get("naming_presets") or {}).items():
+        if preset_id != DEFAULT_PRESET_ID and isinstance(preset, dict):
+            presets.append((preset_id, preset.get("label") or preset_id))
+    return presets
+
+
+def normalize_map_types(map_types: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fills in what a hand-written preset may leave out: color space and
+    raw (per-channel defaults), and empty "match"/"suffixes" lists."""
+    normalized = []
+    for mt in map_types:
+        full = dict(_MAP_TYPE_DEFAULTS.get(mt["id"], {"color_space": "Raw", "raw": True}))
+        full.update({"match": [], "suffixes": []})
+        full.update(mt)
+        normalized.append(full)
+    return normalized
+
+
+def apply_naming_preset(config: Dict[str, Any], preset_id: Optional[str],
+                        warn_fn: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Copy of `config` whose map_types / suffix_strip_list come from the
+    chosen preset — the rest of the pipeline (scan, match, apply) only
+    ever sees a regular config. Unknown preset -> default, with a warning."""
+    effective = dict(config)
+    preset_id = preset_id or DEFAULT_PRESET_ID
+    preset = (config.get("naming_presets") or {}).get(preset_id)
+    if preset_id != DEFAULT_PRESET_ID and not isinstance(preset, dict):
+        if warn_fn:
+            warn_fn(f"[TextureAutoloader] Unknown naming preset '{preset_id}' — using the default.")
+        preset_id, preset = DEFAULT_PRESET_ID, None
+    effective["naming_preset"] = preset_id
+    if preset_id == DEFAULT_PRESET_ID or not preset.get("map_types"):
+        effective["map_types"] = normalize_map_types(config["map_types"])
+        return effective
+
+    map_types = normalize_map_types(preset["map_types"])
+    effective["map_types"] = map_types
+    effective["suffix_strip_list"] = preset.get("suffix_strip_list") or sorted({
+        token.strip("_-.")
+        for mt in map_types for token in mt["suffixes"] + mt["match"]
+        if token.strip("_-.")})
+    return effective
 
 
 def state_path(app_dir: str) -> str:
@@ -618,21 +723,42 @@ def push_recent_folder(recent: List[str], folder: str) -> List[str]:
     return updated[:MAX_RECENT_FOLDERS]
 
 
+def classify_map_type(file_path: str, map_types: List[Dict[str, Any]]) -> Optional[str]:
+    """Map type id of a file, or None.
+
+    1. "suffixes" (naming presets): what the name ENDS with, once the
+       resolution/UDIM/API tags are stripped ("Rock_BC_4k.1001.png" ends
+       with "BC"). The longest matching suffix wins, so "Base_Color"
+       beats "Color".
+    2. "match" (the default convention): substring anywhere in the file
+       name, first type in the list wins — the original behavior."""
+    fname = os.path.basename(file_path)
+    stem = _strip_trailing_modifiers(os.path.splitext(fname)[0]).lower()
+    best_id, best_len = None, 0
+    for mt in map_types:
+        for sfx in mt.get("suffixes", []):
+            s = sfx.lower()
+            if len(s) > best_len and (stem == s or re.search(rf'[._\-]{re.escape(s)}$', stem)):
+                best_id, best_len = mt["id"], len(s)
+    if best_id:
+        return best_id
+
+    fname_lower = fname.lower()
+    for mt in map_types:
+        if any(s.lower() in fname_lower for s in mt.get("match", [])):
+            return mt["id"]
+    return None
+
+
 def bucket_files_by_type(file_paths: List[str],
                           map_types: List[Dict[str, Any]]
                           ) -> Tuple[Dict[str, List[str]], List[str]]:
-    """Groups files by map type via substring match (the first type in
-    the list that matches claims the file). Returns
+    """Groups files by map type (see classify_map_type). Returns
     (buckets, files_with_no_recognized_type)."""
     buckets: Dict[str, List[str]] = {}
     unmatched: List[str] = []
     for file_path in file_paths:
-        fname_lower = os.path.basename(file_path).lower()
-        matched_id = None
-        for mt in map_types:
-            if any(s in fname_lower for s in mt["match"]):
-                matched_id = mt["id"]
-                break
+        matched_id = classify_map_type(file_path, map_types)
         if matched_id:
             buckets.setdefault(matched_id, []).append(file_path)
         else:

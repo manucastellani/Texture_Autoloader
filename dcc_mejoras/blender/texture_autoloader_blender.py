@@ -142,6 +142,11 @@ def _config() -> Dict[str, Any]:
     return core.load_config(_app_dir(), warn_fn=_warn)
 
 
+def _effective_config(props) -> Dict[str, Any]:
+    """Config de disco + el preset de nombres elegido en el panel."""
+    return core.apply_naming_preset(_config(), props.naming_preset, warn_fn=_warn)
+
+
 def _t(key: str, **kwargs) -> str:
     scene = bpy.context.scene
     language = getattr(scene.texture_autoloader, "language", core.DEFAULT_LANGUAGE) \
@@ -468,6 +473,29 @@ def _on_recursive_update(self, context):
     core.save_state(_app_dir(), state)
 
 
+# Blender necesita que los strings de un EnumProperty dinámico sigan
+# vivos después de devolverlos (si no, el menú muestra basura): se
+# guardan acá en vez de en una lista temporal.
+_NAMING_PRESET_ITEMS: List[Tuple[str, str, str]] = []
+
+
+def _naming_preset_items(self, context):
+    global _NAMING_PRESET_ITEMS
+    tooltip = core.tr(self.language, "naming_preset_tooltip")
+    _NAMING_PRESET_ITEMS = [(preset_id, label, tooltip)
+                            for preset_id, label in core.list_naming_presets(_config(), self.language)]
+    return _NAMING_PRESET_ITEMS
+
+
+def _on_naming_preset_update(self, context):
+    state = core.load_state(_app_dir())
+    state["last_naming_preset"] = self.naming_preset
+    core.save_state(_app_dir(), state)
+    # El agrupamiento en sets depende de los sufijos: re-escanear.
+    if self.folder:
+        _scan_folder(self)
+
+
 class TEXTUREAUTOLOADER_PG_properties(PropertyGroup):
     folder: StringProperty(
         name="Folder", subtype='DIR_PATH', default="")
@@ -490,6 +518,11 @@ class TEXTUREAUTOLOADER_PG_properties(PropertyGroup):
         items=[("en", "English", ""), ("es", "Español", "")],
         default="en",
         update=_on_language_update,
+    )
+    naming_preset: EnumProperty(
+        name="Naming preset",
+        items=_naming_preset_items,
+        update=_on_naming_preset_update,
     )
     scan_info: StringProperty(name="Scan info", default="")
     match_status: StringProperty(name="Match status", default="")
@@ -558,36 +591,43 @@ class TEXTUREAUTOLOADER_OT_scan_folder(Operator):
     bl_description = "Scan the selected folder for texture sets"
 
     def execute(self, context):
-        global _TEX_MAP, _MATCHES
-        props = context.scene.texture_autoloader
-        folder = props.folder
-
-        # Blender's DIR_PATH StringProperty stores paths like "//textures/"
-        # (blend-relative) or with a trailing separator — normalize both.
-        folder = bpy.path.abspath(folder)
-
-        if not folder or not os.path.isdir(folder):
-            self.report({'WARNING'}, _t("msg_folder_missing", folder=folder or "(empty)"))
+        error = _scan_folder(context.scene.texture_autoloader)
+        if error:
+            self.report({'WARNING'}, error)
             return {'CANCELLED'}
-
-        config = _config()
-        _TEX_MAP = core.scan_texture_folder(
-            folder, config["suffix_strip_list"], set(config["texture_extensions"]),
-            recursive=props.recursive)
-        _MATCHES = []
-
-        total_files = sum(len(v) for v in _TEX_MAP.values())
-        props.scan_info = _t("scan_info", sets=len(_TEX_MAP), files=total_files)
-        props.match_status = ""
-
-        state = core.load_state(_app_dir())
-        recent = core.push_recent_folder(state.get("recent_folders", []), folder)
-        state["recent_folders"] = recent
-        state["last_recursive"] = props.recursive
-        core.save_state(_app_dir(), state)
-
-        _log_print(f"[TextureAutoloader] Loaded {len(_TEX_MAP)} set(s) from: {folder}")
         return {'FINISHED'}
+
+
+def _scan_folder(props) -> Optional[str]:
+    """Escanea props.folder con el preset de nombres elegido. Devuelve un
+    mensaje de error, o None si salió bien. Separado del operator para
+    poder re-escanear también al cambiar de preset."""
+    global _TEX_MAP, _MATCHES
+    # Blender's DIR_PATH StringProperty stores paths like "//textures/"
+    # (blend-relative) or with a trailing separator — normalize both.
+    folder = bpy.path.abspath(props.folder)
+
+    if not folder or not os.path.isdir(folder):
+        return _t("msg_folder_missing", folder=folder or "(empty)")
+
+    config = _effective_config(props)
+    _TEX_MAP = core.scan_texture_folder(
+        folder, config["suffix_strip_list"], set(config["texture_extensions"]),
+        recursive=props.recursive)
+    _MATCHES = []
+
+    total_files = sum(len(v) for v in _TEX_MAP.values())
+    props.scan_info = _t("scan_info", sets=len(_TEX_MAP), files=total_files)
+    props.match_status = ""
+
+    state = core.load_state(_app_dir())
+    recent = core.push_recent_folder(state.get("recent_folders", []), folder)
+    state["recent_folders"] = recent
+    state["last_recursive"] = props.recursive
+    core.save_state(_app_dir(), state)
+
+    _log_print(f"[TextureAutoloader] Loaded {len(_TEX_MAP)} set(s) from: {folder}")
+    return None
 
 
 class TEXTUREAUTOLOADER_OT_smart_match(Operator):
@@ -607,7 +647,7 @@ class TEXTUREAUTOLOADER_OT_smart_match(Operator):
             self.report({'WARNING'}, _t("msg_load_folder_first"))
             return {'CANCELLED'}
 
-        config = _config()
+        config = _effective_config(context.scene.texture_autoloader)
         object_entries: List[Tuple[str, Optional[str]]] = []
         for obj in selected:
             assigned = _get_assigned_material_name(obj) if props.match_mode == "material_id" else None
@@ -659,7 +699,7 @@ class TEXTUREAUTOLOADER_OT_reassign_match(Operator):
     def execute(self, context):
         global _MATCHES
         if 0 <= self.match_index < len(_MATCHES):
-            config = _config()
+            config = _effective_config(context.scene.texture_autoloader)
             m = _MATCHES[self.match_index]
             new_base = self.tex_base or None
             _MATCHES[self.match_index] = core.build_match_entry(
@@ -705,7 +745,7 @@ class TEXTUREAUTOLOADER_OT_apply_all(Operator):
             self.report({'WARNING'}, _t("msg_run_smart_match_first"))
             return {'CANCELLED'}
 
-        config = _config()
+        config = _effective_config(context.scene.texture_autoloader)
         conflicts = [m["obj"] for m in _MATCHES if m["tex_base"]
                      and bpy.data.objects.get(m["obj"])
                      and has_autoloader_material(bpy.data.objects[m["obj"]])]
@@ -773,7 +813,7 @@ class TEXTUREAUTOLOADER_OT_manual_apply(Operator):
 
     def execute(self, context):
         obj = context.active_object
-        config = _config()
+        config = _effective_config(context.scene.texture_autoloader)
         file_paths = [os.path.join(self.directory, f.name) for f in self.files]
         if not file_paths:
             return {'CANCELLED'}
@@ -827,6 +867,13 @@ class TEXTUREAUTOLOADER_PT_main(Panel):
         lang_row.operator(
             TEXTUREAUTOLOADER_OT_toggle_language.bl_idname,
             text=core.tr(core.other_language(L), "lang_button"))
+
+        layout.separator()
+
+        # ── Settings (afectan al modo manual y al Auto-Loader) ──
+        box = layout.box()
+        box.label(text="◇  " + core.tr(L, "section_settings"))
+        box.prop(props, "naming_preset", text=core.tr(L, "naming_preset_label"))
 
         layout.separator()
 
@@ -962,6 +1009,10 @@ def register():
             props.threshold = state.get("last_threshold", config.get("match_threshold", 0.60))
             props.match_mode = state.get("last_match_mode", config.get("match_mode", "object_name"))
             props.recursive = bool(state.get("last_recursive", False))
+            preset = core.apply_naming_preset(
+                config, state.get("last_naming_preset", config.get("naming_preset")),
+                warn_fn=_warn)["naming_preset"]
+            props.naming_preset = preset
     except Exception:
         pass
 

@@ -75,17 +75,38 @@ def check(condition, message, failures):
         failures.append(message)
 
 
+_APP = None  # module-level: if Python frees the QApplication while Maya runs, Maya crashes
+
+
 def run():
+    global _APP
+    # The dialog smoke test needs a GUI QApplication, and it has to exist
+    # BEFORE maya.standalone starts: otherwise Maya creates a plain
+    # QCoreApplication and building any widget aborts the process.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6 import QtWidgets
+    except ImportError:
+        from PySide2 import QtWidgets
+    _APP = app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
     import maya.standalone
     maya.standalone.initialize(name="python")
     import maya.cmds as cmds
 
-    failures = []
     cmds.loadPlugin("mtoa", quiet=True)
     print(f"Maya {cmds.about(version=True)} — mtoa loaded: "
           f"{cmds.pluginInfo('mtoa', query=True, loaded=True)}")
 
     tmp = tempfile.mkdtemp(prefix="tal_maya_")
+    try:
+        return _run_checks(cmds, app, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_checks(cmds, app, tmp):
+    failures = []
     tex_dir = os.path.join(tmp, "textures")
     os.makedirs(tex_dir)
     make_textures(tex_dir)
@@ -148,12 +169,74 @@ def run():
                      "2/2 object(s) applied"):
         check(expected in report, f"report says: {expected}", failures)
 
+    # ── Naming preset with short suffixes (_BC / _N / _R) ───────
+    short_dir = os.path.join(tmp, "short")
+    os.makedirs(short_dir)
+    for name in ("Hero_BC.png", "Hero_N.png", "Hero_R.png"):
+        write_png(os.path.join(short_dir, name))
+    hero = cmds.polyCube(name="SM_Hero")[0]
+    short_config = ta.core.apply_naming_preset(config, "short_suffixes")
+    hero_matches = ta.match_objects_to_textures(
+        [hero], ta.scan_folder(short_dir, short_config), short_config)
+    ta.apply_auto_textures(hero_matches, short_config)
+    shader = ta._find_autoloader_shader(hero)
+    check(shader is not None, f"short_suffixes preset: SM_Hero got a material ({shader})", failures)
+    if shader:
+        for attr, expected in (("baseColor", "Hero_BC.png"), ("specularRoughness", "Hero_R.png")):
+            src = source_node(cmds, f"{shader}.{attr}")
+            got = os.path.basename(cmds.getAttr(f"{src}.fileTextureName")) if src else None
+            check(got == expected, f"...{expected} feeds {attr} (got {got})", failures)
+        bump = source_node(cmds, f"{shader}.normalCamera")
+        check(bump is not None and cmds.nodeType(bump) == "bump2d",
+              "...Hero_N.png goes through a bump2d", failures)
+
+    # ── Qt dialog smoke test (offscreen) ────────────────────────
+    # Builds the real dialog and drives a few handlers: catches typos and
+    # missing widgets in UI code that no other test executes.
+    dlg = ta.TextureAutoloaderDialog()
+    presets = [dlg.combo_naming_preset.itemData(i) for i in range(dlg.combo_naming_preset.count())]
+    check(presets[:1] == ["default"] and "short_suffixes" in presets,
+          f"dialog lists the naming presets ({presets})", failures)
+    dlg._on_toggle_language()
+    check(dlg.lbl_naming_preset.text() == "PRESET DE NOMBRES", "dialog switches to Spanish", failures)
+    dlg._on_toggle_language()
+    dlg._set_folder(short_dir)
+    check(sorted(dlg.tex_map) == ["Hero_BC", "Hero_N", "Hero_R"],
+          f"default preset doesn't know _BC/_N/_R (sets: {sorted(dlg.tex_map)})", failures)
+    dlg._on_naming_preset_activated(dlg.combo_naming_preset.findData("short_suffixes"))
+    check(sorted(dlg.tex_map) == ["Hero"],
+          f"picking short_suffixes re-scans into one set (sets: {sorted(dlg.tex_map)})", failures)
+    check(ta.core.load_state(ta._app_dir()).get("last_naming_preset") == "short_suffixes",
+          "the chosen preset is remembered in the state file", failures)
+    dlg.close()
+    app.processEvents()
+
     print()
     if failures:
         print(f"TAL_MAYA_TEST: FAILED ({len(failures)})")
         return 1
     print("TAL_MAYA_TEST: PASSED")
     return 0
+
+
+def _hard_exit(code):
+    """Leave without running Maya's shutdown: with a QApplication alive,
+    maya.standalone can hang or crash while unloading (Arnold, Qt) — after
+    the result is already printed, but it leaves a "Fatal Error" and a
+    recovery .ma in %TEMP% behind. On Windows even os._exit still runs the
+    DLL unload code, so terminate the process outright."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32")
+        # Declared on purpose: with ctypes' default int types the 64-bit
+        # process handle gets truncated and TerminateProcess silently fails.
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
+    os._exit(code)
 
 
 if __name__ == "__main__":
@@ -163,6 +246,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("TAL_MAYA_TEST: ERROR")
         code = 1
-    # os._exit: maya.standalone can hang on interpreter shutdown.
-    sys.stdout.flush()
-    os._exit(code)
+    _hard_exit(code)

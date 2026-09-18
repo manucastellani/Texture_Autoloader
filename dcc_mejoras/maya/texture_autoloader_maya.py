@@ -822,6 +822,11 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         self.match_mode: str = "object_name"
         self.language: str = self.state.get(
             "language", self.config.get("language", core.DEFAULT_LANGUAGE))
+        self.naming_preset: str = core.apply_naming_preset(
+            self.config,
+            self.state.get("last_naming_preset",
+                           self.config.get("naming_preset", core.DEFAULT_PRESET_ID)),
+            warn_fn=_warn)["naming_preset"]
 
         self._build_ui()
         self.setStyleSheet(_STYLESHEET)
@@ -849,6 +854,11 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
     def _t(self, key: str, **kwargs) -> str:
         return core.tr(self.language, key, **kwargs)
 
+    def _cfg(self) -> Dict[str, Any]:
+        """Config efectivo: el de disco + el preset de nombres elegido
+        (y el threshold del slider, que vive en self.config)."""
+        return core.apply_naming_preset(self.config, self.naming_preset)
+
     def _on_toggle_language(self) -> None:
         self.language = core.other_language(self.language)
         self.state["language"] = self.language
@@ -865,6 +875,11 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         self.lbl_header_subtitle.setText(self._t("app_subtitle"))
         self.btn_language.setText(core.tr(core.other_language(L), "lang_button"))
         self.btn_language.setToolTip(self._t("lang_button_tooltip"))
+
+        self.lbl_settings_tag.setText("◇  " + self._t("section_settings"))
+        self.lbl_naming_preset.setText(self._t("naming_preset_label"))
+        self.combo_naming_preset.setToolTip(self._t("naming_preset_tooltip"))
+        self._refresh_naming_preset_combo()
 
         self.lbl_manual_tag.setText("◆  " + self._t("section_manual"))
         self.lbl_manual_desc.setText(self._t("section_manual_desc"))
@@ -909,6 +924,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         c_layout.setContentsMargins(0, 0, 0, 0)
         c_layout.setSpacing(14)
 
+        c_layout.addWidget(self._build_settings_card())
         c_layout.addWidget(self._build_manual_card())
         c_layout.addWidget(self._build_autoloader_card(), 1)
         c_layout.addWidget(self._build_footer())
@@ -955,6 +971,38 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         outer.addWidget(accent)
 
         return header
+
+    def _settings_row(self, lay: QtWidgets.QVBoxLayout, combo: QtWidgets.QComboBox
+                      ) -> QtWidgets.QLabel:
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        label = QtWidgets.QLabel()
+        label.setProperty("class", "MutedSmall")
+        label.setStyleSheet("letter-spacing:2px; font-weight:700;")
+        label.setFixedWidth(170)
+        combo.setEditable(False)
+        combo.setCursor(QtCore.Qt.PointingHandCursor)
+        row.addWidget(label)
+        row.addWidget(combo, 1)
+        lay.addLayout(row)
+        return label
+
+    def _build_settings_card(self) -> QtWidgets.QFrame:
+        """Opciones que afectan tanto al modo manual como al Auto-Loader."""
+        card = QtWidgets.QFrame()
+        card.setProperty("class", "Card")
+        lay = QtWidgets.QVBoxLayout(card)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(8)
+
+        self.lbl_settings_tag = QtWidgets.QLabel()
+        self.lbl_settings_tag.setProperty("class", "SectionTag")
+        lay.addWidget(self.lbl_settings_tag)
+
+        self.combo_naming_preset = QtWidgets.QComboBox()
+        self.combo_naming_preset.activated.connect(self._on_naming_preset_activated)
+        self.lbl_naming_preset = self._settings_row(lay, self.combo_naming_preset)
+        return card
 
     def _build_manual_card(self) -> QtWidgets.QFrame:
         card = QtWidgets.QFrame()
@@ -1199,7 +1247,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
     # ── Handlers ─────────────────────────────────────────────
 
     def _on_manual_apply(self) -> None:
-        report = load_textures_and_apply(self.config, self.language)
+        report = load_textures_and_apply(self._cfg(), self.language)
         if report:
             self._show_report_dialog(report)
 
@@ -1228,6 +1276,26 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         self._persist_state()
         self._update_match_mode_info()
 
+    def _refresh_naming_preset_combo(self) -> None:
+        self.combo_naming_preset.blockSignals(True)
+        self.combo_naming_preset.clear()
+        for preset_id, label in core.list_naming_presets(self.config, self.language):
+            self.combo_naming_preset.addItem(label, preset_id)
+        index = self.combo_naming_preset.findData(self.naming_preset)
+        self.combo_naming_preset.setCurrentIndex(max(index, 0))
+        self.combo_naming_preset.blockSignals(False)
+
+    def _on_naming_preset_activated(self, index: int) -> None:
+        preset_id = self.combo_naming_preset.itemData(index)
+        if not preset_id or preset_id == self.naming_preset:
+            return
+        self.naming_preset = preset_id
+        self.state["last_naming_preset"] = preset_id
+        self._persist_state()
+        # El agrupamiento en sets depende de los sufijos: re-escanear.
+        if self.folder:
+            self._set_folder(self.folder)
+
     def _update_match_mode_info(self) -> None:
         key = "match_mode_info_material_id" if self.match_mode == "material_id" \
             else "match_mode_info_object_name"
@@ -1243,7 +1311,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
 
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self.tex_map = scan_folder(folder, self.config, recursive)
+            self.tex_map = scan_folder(folder, self._cfg(), recursive)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
@@ -1288,7 +1356,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
             _warn(self._t("msg_load_folder_first"))
             return
 
-        self.matches = match_objects_to_textures(sel, self.tex_map, self.config,
+        self.matches = match_objects_to_textures(sel, self.tex_map, self._cfg(),
                                                   match_mode=self.match_mode)
         self._populate_tree()
         matched = sum(1 for m in self.matches if m["tex_base"])
@@ -1326,7 +1394,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
 
         new_base = None if choice == none_label else choice
         self.matches[match_idx] = core.build_match_entry(
-            m["obj"], new_base, 1.0 if new_base else 0.0, self.tex_map, self.config, warn_fn=_warn)
+            m["obj"], new_base, 1.0 if new_base else 0.0, self.tex_map, self._cfg(), warn_fn=_warn)
         self._populate_tree()
 
     def _on_edit_channel(self, match_idx: int, map_id: str) -> None:
@@ -1390,7 +1458,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
 
         cmds.undoInfo(openChunk=True)
         try:
-            applied, skipped = apply_auto_textures(self.matches, self.config, progress_cb=_cb)
+            applied, skipped = apply_auto_textures(self.matches, self._cfg(), progress_cb=_cb)
         finally:
             cmds.undoInfo(closeChunk=True)
             progress.setValue(len(self.matches))
