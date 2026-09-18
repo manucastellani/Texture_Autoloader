@@ -365,8 +365,12 @@ def get_logger(app_dir: str) -> "logging.Logger":
 
     try:
         log_path = os.path.join(app_dir, LOG_FILENAME)
+        # delay=True: el archivo se crea recién con el primer mensaje, no al
+        # crear el handler — así un app_dir que nunca loguea nada no queda
+        # con un .log vacío (y los loggers de dos app_dir distintos no
+        # dejan rastro el uno en la carpeta del otro).
         handler = logging.handlers.RotatingFileHandler(
-            log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+            log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8", delay=True)
         handler.setLevel(logging.DEBUG)
         handler.setFormatter(logging.Formatter(
             "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
