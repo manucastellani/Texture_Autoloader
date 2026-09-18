@@ -26,27 +26,36 @@ en copias separadas de Maya y Blender. El port a Unreal también reutiliza este 
 para escanear, matchear y agrupar por tipo — solo lo propio de Unreal (import de
 assets, Material Slots) se escribe aparte.
 
-## Estado real de cada mejora (verificado contra el código, no asumido)
-- **UDIM: YA IMPLEMENTADO.** El core detecta tiles 1001–1999 y excluye sufijos de
-  resolución (1024, 2048...). Configurado en `texture_autoloader_maya.py:428` (Maya) y
-  `texture_autoloader_blender.py:199` (Blender). Falta más testing, sobre todo en
-  Blender — no falta implementarlo.
-- **Presets de naming convention: PARCIAL.** `map_types` y `suffix_strip_list` ya se
-  leen desde `texture_autoloader_config.json` (`core:253`), o sea que la convención ya
-  es configurable. Lo que falta es la capa de presets: varias convenciones guardadas
-  con nombre para elegir entre ellas, en vez de editar el JSON a mano.
-- **Reporte de matching: PARCIAL.** Hoy solo se loguean los archivos que no se
-  reconocieron (`texture_autoloader_maya.py:462`). Falta ampliarlo a un reporte
-  ✔/✘ completo (matches exitosos + fallidos).
+## Estado real de cada mejora (en `feature/unreal-port`, verificado con tests)
+- **UDIM: probado, con 2 bugs encontrados y corregidos en `dcc_mejoras/`** (los dos
+  siguen en `main`):
+  - Los tiles con punto (`Pared_BaseColor.1001.png`, el formato por defecto de
+    Substance y Mari) quedaban como sets separados y el UDIM nunca se armaba.
+  - Blender tomaba como número de tile el primer grupo de 4 dígitos del nombre
+    (`Crate2048_BaseColor.1001.png` → tile 2048).
+  - Verificado en Maya 2027 + Arnold y en Blender 5.0 / 5.1 (tests de integración).
+- **Reporte ✔/✘: HECHO.** `core.build_report`, compartido por Maya, Blender y Unreal:
+  ✔ cableado, ✘ sin match / sin input / error, – omitido a propósito (canal
+  desactivado, displacement opcional, archivo duplicado). Maya: diálogo final
+  ("Show Details…") + Script Editor. Blender: bloque de texto
+  `TextureAutoloader_Report` + popup. Unreal: diálogo + Output Log.
+- **Presets de naming convention: HECHO.** `naming_presets` en el config + combo en
+  Maya y Blender (campo en Unreal). Los presets usan `suffixes` anclados al final del
+  nombre (así `_R` no confunde `Car_Rim_BC.png` con roughness); el preset "default" es
+  el `map_types` de siempre. Incluye un ejemplo: `short_suffixes`.
 - **Thumbnails: DESCARTADOS** (decisión tomada en este chat — complejidad de UI no
   justificada para el tamaño de la herramienta). El README público todavía los anota
   como "próximos pasos razonables" — corregir el README cuando se haga el merge a `main`.
-- **Selector de motor de destino: NO EXISTE todavía.** `aiStandardSurface` está fijo en
-  el código (`texture_autoloader_maya.py:393`). Esto sigue siendo una mejora real
-  pendiente, no implementada.
+- **Selector de motor de destino (Maya): HECHO para Arnold. Redshift y V-Ray están
+  escritos pero SIN PROBAR en un Maya con esos renderers** (en la máquina de desarrollo
+  solo está Arnold; sus plantillas se verifican contra el stub de `maya.cmds`).
+  Diccionario `ENGINE_TEMPLATES` en `dcc_mejoras/maya/texture_autoloader_maya.py`;
+  cada atributo se verifica antes de conectar y, si no existe, sale como ✘ en el
+  reporte. Blender no necesita selector (Principled BSDF sirve para Cycles y EEVEE).
 
 ## Port a Unreal Engine
-- Reutiliza el `core` de `advanced/` para escanear, matchear y agrupar texturas por tipo.
+- Reutiliza el `core` compartido (`dcc_mejoras/core/`, copia de `advanced/`) para
+  escanear, matchear y agrupar texturas por tipo.
 - Se implementa vía Unreal Python Editor Scripting API
   (`unreal.MaterialEditingLibrary`, `unreal.AssetToolsHelpers`, etc.).
 - **Diferencia clave de arquitectura**: en Unreal no se arma un grafo de nodos por
@@ -61,13 +70,36 @@ assets, Material Slots) se escribe aparte.
     de archivo directa, como en Maya/Blender.
   - El flag `raw` del config pasa a ser sRGB desactivado + un compression setting.
 - Requiere UI vía Editor Utility Widget o plugin con menú propio.
+- **Estado: v1 funcionando en UE 5.7 y 5.8** (`unreal/texture_autoloader_unreal.py`,
+  instrucciones en `unreal/README.md`):
+  - Cada slot prueba `<mesh>_<slot>` (el `$mesh_$textureSet` de Substance), `<slot>` y
+    `<mesh>`; los slots con nombre genérico (`WorldGridMaterial`, `None`) usan el mesh.
+  - UI: menú propio (clic derecho en el Content Browser y Tools) + diálogo nativo de
+    propiedades (`EditorDialog.show_object_details_view`), no Editor Utility Widget:
+    así el repo no lleva `.uasset` binarios. Se instala agregando `<repo>/unreal` en
+    Project Settings › Plugins › Python › Additional Paths (corre `init_unreal.py`).
+  - Si el Master Material no existe, se genera uno por defecto (+ variante Masked para
+    sets con opacidad) con texturas neutras generadas por la herramienta.
+  - Pendiente: UDIM (se reporta y se saltea — requiere virtual textures),
+    displacement y texturas empaquetadas (ORM).
+
+## Tests (cómo correrlos)
+- Ningún Python de los DCCs trae pytest: instalarlo en cualquier Python y correr cada
+  suite por separado (comparten nombres de archivo con las de `advanced/`):
+  `pytest dcc_mejoras/tests`, `pytest dcc_mejoras/maya/tests`, `pytest unreal/tests`.
+- Integración, dentro de cada programa real y sin interfaz:
+  - Maya: `mayapy dcc_mejoras/maya/tests/run_in_mayapy.py` (usa Arnold).
+  - Blender: `blender -b --factory-startup --python-exit-code 1 --python dcc_mejoras/blender/tests/run_in_blender.py`
+  - Unreal: `unreal/tests/run_in_unreal.py` sobre un proyecto descartable (comando en
+    `unreal/README.md`; en 5.7 como commandlet hace falta
+    `-ini:Engine:[ConsoleVariables]:Interchange.FeatureFlags.Import.PNG=0`).
+- Programas instalados en la máquina de desarrollo: Maya 2022 / 2027 (con Arnold),
+  Blender 5.0 / 5.1, Unreal 5.7 / 5.8.
 
 ## Estado de git (al momento de este documento)
-- Solo existe `main`. La rama `feature/unreal-port` todavía no se creó.
-- `CLAUDE.md` todavía no está trackeado por git. **Decisión pendiente de confirmar**:
-  se agrega dentro de la rama `feature/unreal-port` (no a `.gitignore`, no directo a
-  `main`) — así queda versionado pero aislado hasta el merge, igual que el resto del
-  trabajo de prueba.
+- Rama `feature/unreal-port` creada desde `main` (61076ac), solo local (sin push).
+  `main` sin cambios.
+- `CLAUDE.md` versionado dentro de la rama (no en `main`).
 
 ## Estructura de trabajo del repo
 
@@ -95,4 +127,12 @@ flujo de trabajo, por encima de la velocidad o la comodidad de editar.
   Draft.
 
 ## Pendiente de corregir al momento del merge
-- README público: sacar la mención a thumbnails como "próximos pasos" (se descartaron).
+- README público: sacar la mención a thumbnails como "próximos pasos" (se descartaron)
+  y documentar las mejoras nuevas y el port a Unreal.
+- Los fixes hechos en `dcc_mejoras/` también corrigen bugs que están en `main`: UDIM
+  con punto, número de tile en Blender, `.log` vacío (hacía fallar un test) y
+  displacement leído sin `alphaIsLuminance`. Hay que portarlos a `advanced/` y a los
+  standalone (`maya/`, `blender/`), que son copias a mano.
+- Decidir la estructura final: si `dcc_mejoras/` reemplaza a `advanced/` y si el port
+  pasa a `advanced/unreal/` (hoy apunta a `../dcc_mejoras/core`).
+- Probar Redshift y V-Ray en un Maya con esos renderers antes de publicarlos.
