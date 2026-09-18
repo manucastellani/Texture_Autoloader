@@ -97,8 +97,8 @@ def run():
 
     crate = make_mesh("SM_Crate2048")
     rock = make_mesh("SM_Rock")
-    for obj in (crate, rock):
-        obj.select_set(True)
+    for obj in bpy.context.scene.objects:  # the factory scene's Cube starts selected
+        obj.select_set(obj in (crate, rock))
 
     props = bpy.context.scene.texture_autoloader
     props.folder = tex_dir
@@ -154,6 +154,20 @@ def run():
             check(len(color_inputs) == 2,
                   f"...with base color and AO both on the color inputs (got {len(color_inputs)})",
                   failures)
+
+    # ── ✔/✘ report ──────────────────────────────────────────────
+    text = bpy.data.texts.get(addon.REPORT_TEXT_NAME)
+    check(text is not None, f"the report is saved as the text block '{addon.REPORT_TEXT_NAME}'",
+          failures)
+    report = text.as_string() if text else ""
+    for expected in ("✔ Crate2048_BaseColor.<UDIM>.png → baseColor",
+                     "✔ Rock_Roughness.png → roughness",
+                     "✔ Rock_AO.png → ao",
+                     "✘ no match: Rock_Curvature.png",
+                     "2/2 object(s) applied"):
+        check(expected in report, f"report says: {expected}", failures)
+    if failures:
+        print("\n--- report ---\n" + report + "\n--------------")
 
     print()
     if failures:

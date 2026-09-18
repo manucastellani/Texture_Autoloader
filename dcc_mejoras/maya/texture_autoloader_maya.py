@@ -76,6 +76,7 @@ pattern on repeated UVs).
 ---------------------------------------------------------------------
 """
 
+import html
 import os
 import sys
 from typing import Optional, List, Dict, Tuple, Any
@@ -356,33 +357,53 @@ def get_selected_mesh() -> Optional[str]:
     return selection[0]
 
 
-def load_textures_and_apply(config: Optional[Dict[str, Any]] = None) -> None:
+def load_textures_and_apply(config: Optional[Dict[str, Any]] = None,
+                            language: str = core.DEFAULT_LANGUAGE) -> Optional[str]:
+    """Modo manual: aplica archivos elegidos a mano al objeto seleccionado.
+    Devuelve el reporte ✔/✘ (o None si se canceló la selección)."""
     config = config or core.load_config(_app_dir(), warn_fn=_warn)
     selected_obj = get_selected_mesh()
     if not selected_obj:
-        return
+        return None
     file_paths = cmds.fileDialog2(
         fileMode=4, dialogStyle=2,
-        caption="Seleccionar Texturas de Substance",
+        caption=core.tr(language, "select_files_dialog"),
         fileFilter="Images (*.png *.jpg *.jpeg *.tga *.exr *.tif *.tiff)"
     )
     if not file_paths:
-        return
+        return None
+
+    label = core.tex_base_name(os.path.basename(file_paths[0]), config["suffix_strip_list"])
+    entry = core.build_entry_from_files(selected_obj, label, file_paths, config, warn_fn=_warn)
+    channel_files = {mid: ch["file"] for mid, ch in entry["channels"].items()}
     cmds.undoInfo(openChunk=True)
     try:
-        process_textures(file_paths, selected_obj, config=config)
+        entry["result"] = process_textures(
+            None, selected_obj, mat_basename=core.mesh_base_name(selected_obj, config["mesh_prefixes"]),
+            config=config, channel_files=channel_files)
+        entry["status"] = "applied"
+    except Exception as e:
+        entry["status"], entry["error"] = "error", str(e)
+        _warn(f"[TextureAutoloader] {selected_obj}: {e}")
     finally:
         cmds.undoInfo(closeChunk=True)
+
+    report = core.build_report([entry], language)
+    _log_print(report)
+    return report
 
 
 def process_textures(file_paths: Optional[List[str]], selected_obj: str,
                       mat_basename: Optional[str] = None,
                       config: Optional[Dict[str, Any]] = None,
-                      channel_files: Optional[Dict[str, str]] = None) -> int:
+                      channel_files: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """
     Crea un aiStandardSurface NUEVO, lo asigna al objeto y conecta las
     texturas por tipo de mapa. Si el objeto ya tenía un material generado
     por esta herramienta, lo limpia primero.
+
+    Devuelve un core.new_apply_result(): qué canal quedó cableado, cuál
+    se salteó y por qué, y cuál falló — de ahí sale el reporte ✔/✘.
     """
     config = config or core.load_config(_app_dir(), warn_fn=_warn)
     map_types = config["map_types"]
@@ -397,9 +418,10 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
 
     try:
         cmds.sets(selected_obj, forceElement=sg_name)
-    except Exception:
-        _warn(f"No se pudo asignar el material al objeto {selected_obj}.")
-        return len(file_paths or [])
+    except Exception as e:
+        raise RuntimeError(f"could not assign the material to {selected_obj}: {e}")
+
+    result = core.new_apply_result(material=mat_name)
 
     if channel_files is not None:
         resolved: Dict[str, Tuple[str, bool]] = {
@@ -418,6 +440,7 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
 
         if mt["id"] == "displacement" and not config.get("enable_displacement_wiring", False):
             skipped_displacement += 1
+            result["skipped"]["displacement"] = {"reason": "displacement_off"}
             continue
 
         try:
@@ -430,8 +453,10 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
                     pass
             apply_color_space(fn, mt["color_space"], is_raw=mt["raw"])
             _wire_map_type(mt["id"], fn, mat_name, sg_name, created_nodes, stem)
+            result["wired"][mt["id"]] = representative
         except Exception as e:
             _warn(f"Error procesando mapa '{mt['id']}': {e}")
+            result["failed"][mt["id"]] = str(e)
 
     # Post-proceso: AO × BaseColor
     if 'ao' in created_nodes:
@@ -451,6 +476,8 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
             cmds.connectAttr(f"{mult}.output", f"{mat_name}.baseColor", force=True)
         except Exception as e:
             _warn(f"Error configurando multiplicador de AO: {e}")
+            result["wired"].pop("ao", None)
+            result["failed"]["ao"] = str(e)
 
     if skipped_displacement:
         _warn(
@@ -467,10 +494,10 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
 
     core.get_logger(_app_dir()).info(
         f"[TextureAutoloader] Material '{mat_name}' applied to {selected_obj.split('|')[-1]} "
-        f"with {len(created_nodes)} primary channel(s) wired "
-        f"({', '.join(sorted(created_nodes.keys())) or 'none'}).")
+        f"with {len(result['wired'])} channel(s) wired "
+        f"({', '.join(sorted(result['wired'])) or 'none'}).")
 
-    return len(unmatched)
+    return result
 
 
 # ── Auto-Loader: scan + match + apply ──────────────────────────
@@ -502,9 +529,9 @@ def match_objects_to_textures(objects: List[str], tex_map: Dict[str, List[str]],
 def apply_auto_textures(matches: List[Dict[str, Any]],
                          config: Dict[str, Any],
                          progress_cb=None) -> Tuple[int, int]:
-    def _apply_one(obj: str, mat_basename: str, channel_files: Dict[str, str]) -> None:
-        process_textures(None, obj, mat_basename=mat_basename,
-                          config=config, channel_files=channel_files)
+    def _apply_one(obj: str, mat_basename: str, channel_files: Dict[str, str]) -> Dict[str, Any]:
+        return process_textures(None, obj, mat_basename=mat_basename,
+                                config=config, channel_files=channel_files)
 
     return core.apply_auto_textures(
         matches, config, apply_one_fn=_apply_one, progress_cb=progress_cb, log_fn=_log_print)
@@ -1172,7 +1199,9 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
     # ── Handlers ─────────────────────────────────────────────
 
     def _on_manual_apply(self) -> None:
-        load_textures_and_apply(self.config)
+        report = load_textures_and_apply(self.config, self.language)
+        if report:
+            self._show_report_dialog(report)
 
     def _on_browse(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, self._t("select_folder_dialog"))
@@ -1366,17 +1395,29 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
             cmds.undoInfo(closeChunk=True)
             progress.setValue(len(self.matches))
 
+        report = core.build_report(self.matches, self.language, tex_map=self.tex_map)
+        _log_print(report)
+        self._show_report_dialog(report, applied, skipped)
+
+    def _show_report_dialog(self, report: str, applied: Optional[int] = None,
+                            skipped: Optional[int] = None) -> None:
+        """Resumen arriba; el reporte ✔/✘ completo en "Show Details…"
+        (el área desplegable estándar de QMessageBox)."""
+        rows = [f"<p style='font-size:13px;'><b>{self._t('done_title')}</b></p>"]
+        if applied is not None:
+            rows.append(f"<p>{self._t('done_body_applied')}: "
+                        f"<span style='color:#2ED573;'>{applied}</span></p>")
+            rows.append(f"<p>{self._t('done_body_skipped')}: "
+                        f"<span style='color:#FFB547;'>{skipped}</span></p>")
+        rows.append(f"<p>{html.escape(report.splitlines()[-1])}</p>")
+        rows.append(f"<p style='color:#9297A8;'>{self._t('done_body_report_hint')}</p>")
+
         msg = QtWidgets.QMessageBox(self)
         msg.setWindowTitle(self._t("done_title"))
-        msg.setText(
-            f"<div style='font-family:Segoe UI; color:#E8E8EA;'>"
-            f"<p style='font-size:13px;'><b>{self._t('done_title')}</b></p>"
-            f"<p>{self._t('done_body_applied')}: <span style='color:#2ED573;'>{applied}</span></p>"
-            f"<p>{self._t('done_body_skipped')}: <span style='color:#FFB547;'>{skipped}</span></p>"
-            f"</div>"
-        )
+        msg.setText("<div style='font-family:Segoe UI; color:#E8E8EA;'>" + "".join(rows) + "</div>")
+        msg.setDetailedText(report)
         msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
-        msg.exec_()
+        (msg.exec if hasattr(msg, "exec") else msg.exec_)()
 
 
 def create_ui() -> TextureAutoloaderDialog:

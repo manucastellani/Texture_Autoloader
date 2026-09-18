@@ -116,6 +116,26 @@ if not core.HAS_RAPIDFUZZ:
 
 _TEX_MAP: Dict[str, List[str]] = {}
 _MATCHES: List[Dict[str, Any]] = []
+_LAST_REPORT: str = ""
+
+REPORT_TEXT_NAME = "TextureAutoloader_Report"
+
+
+def _publish_report(report: str) -> str:
+    """Deja el reporte ✔/✘ donde se pueda leer después de cerrar el popup:
+    en la consola, en texture_autoloader.log y en un bloque de texto del
+    .blend (Text Editor). Devuelve el nombre de ese bloque de texto."""
+    global _LAST_REPORT
+    _LAST_REPORT = report
+    print(report)
+    try:
+        core.get_logger(_app_dir()).info("\n" + report)
+    except Exception:
+        pass
+    text = bpy.data.texts.get(REPORT_TEXT_NAME) or bpy.data.texts.new(REPORT_TEXT_NAME)
+    text.clear()
+    text.write(report)
+    return text.name
 
 
 def _config() -> Dict[str, Any]:
@@ -257,16 +277,25 @@ def _cleanup_existing_material(obj: "bpy.types.Object") -> int:
         return 0
 
 
+def _color_socket(sockets, name: str) -> "bpy.types.NodeSocket":
+    """El nodo Mix tiene sockets float / vector / color que comparten el
+    nombre ("A", "B", "Result"): pedimos explícitamente el de color en vez
+    de confiar en qué devuelve sockets[name] en cada versión de Blender."""
+    return next((s for s in sockets if s.name == name and s.type == 'RGBA'), sockets[name])
+
+
 def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, str],
-                      config: Dict[str, Any]) -> None:
+                      config: Dict[str, Any]) -> Dict[str, Any]:
     """Crea un material Principled BSDF NUEVO, lo asigna al objeto (único
     slot — reemplaza cualquier asignación anterior) y conecta las
     texturas por tipo de mapa. Si el objeto ya tenía un material generado
-    por esta herramienta, lo limpia primero."""
+    por esta herramienta, lo limpia primero.
+
+    Devuelve un core.new_apply_result(): qué canal quedó cableado, cuál
+    se salteó y por qué, y cuál falló — de ahí sale el reporte ✔/✘."""
     obj = bpy.data.objects.get(obj_name)
     if obj is None:
-        _warn(f"[TextureAutoloader] Object '{obj_name}' not found in the scene — skipped.")
-        return
+        raise RuntimeError(f"object '{obj_name}' not found in the scene")
 
     _cleanup_existing_material(obj)
 
@@ -285,69 +314,70 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
     obj.data.materials.clear()
     obj.data.materials.append(mat)
 
+    result = core.new_apply_result(material=mat.name)
     base_color_node = None
     ao_node = None
     y = 400
     skipped_displacement = 0
+
+    def link_to(node, socket, map_id, file_path, output_name="Color") -> None:
+        """Conecta y anota el canal en el resultado: sin imagen = falló la
+        carga; sin socket = el Principled BSDF de esta versión no lo tiene."""
+        if node is None:
+            result["failed"][map_id] = f"could not load {os.path.basename(file_path)}"
+        elif socket is None:
+            result["skipped"][map_id] = {"reason": "no_target", "target": "Principled BSDF"}
+        else:
+            node_tree.links.new(node.outputs[output_name], socket)
+            result["wired"][map_id] = file_path
 
     for map_id, file_path in channel_files.items():
         is_udim = "<UDIM>" in file_path
 
         if map_id == "displacement" and not config.get("enable_displacement_wiring", False):
             skipped_displacement += 1
+            result["skipped"][map_id] = {"reason": "displacement_off"}
             continue
 
         if map_id == "baseColor":
             node = _add_image_node(node_tree, file_path, is_udim, "sRGB", "Base Color", -400, y)
-            if node:
-                base_color_node = node
-                socket = _socket(bsdf, "Base Color")
-                if socket:
-                    node_tree.links.new(node.outputs["Color"], socket)
+            base_color_node = node
+            link_to(node, _socket(bsdf, "Base Color"), map_id, file_path)
 
         elif map_id == "roughness":
             node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Roughness", -400, y)
-            if node:
-                socket = _socket(bsdf, "Roughness")
-                if socket:
-                    node_tree.links.new(node.outputs["Color"], socket)
+            link_to(node, _socket(bsdf, "Roughness"), map_id, file_path)
 
         elif map_id == "metallic":
             node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Metallic", -400, y)
-            if node:
-                socket = _socket(bsdf, "Metallic")
-                if socket:
-                    node_tree.links.new(node.outputs["Color"], socket)
+            link_to(node, _socket(bsdf, "Metallic"), map_id, file_path)
 
         elif map_id == "normal":
             node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Normal", -600, y)
+            normal_map = None
             if node:
                 normal_map = node_tree.nodes.new("ShaderNodeNormalMap")
                 normal_map.location = (-350, y)
                 node_tree.links.new(node.outputs["Color"], normal_map.inputs["Color"])
-                socket = _socket(bsdf, "Normal")
-                if socket:
-                    node_tree.links.new(normal_map.outputs["Normal"], socket)
+            link_to(normal_map if node else None, _socket(bsdf, "Normal"), map_id, file_path,
+                    output_name="Normal")
 
         elif map_id == "emission":
             node = _add_image_node(node_tree, file_path, is_udim, "sRGB", "Emission", -400, y)
-            if node:
-                color_socket = _socket(bsdf, "Emission Color", "Emission")
-                if color_socket:
-                    node_tree.links.new(node.outputs["Color"], color_socket)
-                strength_socket = _socket(bsdf, "Emission Strength")
-                if strength_socket:
-                    strength_socket.default_value = 1.0
+            link_to(node, _socket(bsdf, "Emission Color", "Emission"), map_id, file_path)
+            strength_socket = _socket(bsdf, "Emission Strength")
+            if node and strength_socket:
+                strength_socket.default_value = 1.0
 
         elif map_id == "ao":
             ao_node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "AO", -400, y)
+            if ao_node is None:
+                result["failed"][map_id] = f"could not load {os.path.basename(file_path)}"
 
         elif map_id == "opacity":
             node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Opacity", -400, y)
+            link_to(node, _socket(bsdf, "Alpha"), map_id, file_path)
             if node:
-                socket = _socket(bsdf, "Alpha")
-                if socket:
-                    node_tree.links.new(node.outputs["Color"], socket)
                 # Blender's transparency handling has changed across
                 # versions (blend_method was removed from EEVEE Next in
                 # 4.2). Best-effort: set it only if the attribute exists.
@@ -358,16 +388,18 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
 
         elif map_id == "displacement":
             node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Displacement", -400, y)
+            disp_node = None
             if node:
                 disp_node = node_tree.nodes.new("ShaderNodeDisplacement")
                 disp_node.location = (150, -300)
                 node_tree.links.new(node.outputs["Color"], disp_node.inputs["Height"])
-                node_tree.links.new(disp_node.outputs["Displacement"], output.inputs["Displacement"])
                 # True displacement only renders correctly in Cycles with
                 # adaptive subdivision on the mesh — this wires the graph
                 # but doesn't configure that for you, same conservative
                 # stance as the Maya version's "detected but not
                 # automatically deformed" behavior.
+            link_to(disp_node, output.inputs["Displacement"], map_id, file_path,
+                    output_name="Displacement")
 
         y -= 260
 
@@ -378,14 +410,18 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
         mix_node.blend_type = 'MULTIPLY'
         mix_node.inputs["Factor"].default_value = 1.0
         mix_node.location = (-150, 400)
+        input_a = _color_socket(mix_node.inputs, "A")
         if base_color_node is not None:
-            node_tree.links.new(base_color_node.outputs["Color"], mix_node.inputs["A"])
+            node_tree.links.new(base_color_node.outputs["Color"], input_a)
         else:
-            mix_node.inputs["A"].default_value = (1.0, 1.0, 1.0, 1.0)
-        node_tree.links.new(ao_node.outputs["Color"], mix_node.inputs["B"])
+            input_a.default_value = (1.0, 1.0, 1.0, 1.0)
+        node_tree.links.new(ao_node.outputs["Color"], _color_socket(mix_node.inputs, "B"))
         base_socket = _socket(bsdf, "Base Color")
         if base_socket:
-            node_tree.links.new(mix_node.outputs["Result"], base_socket)
+            node_tree.links.new(_color_socket(mix_node.outputs, "Result"), base_socket)
+            result["wired"]["ao"] = channel_files["ao"]
+        else:
+            result["skipped"]["ao"] = {"reason": "no_target", "target": "Principled BSDF"}
 
     if skipped_displacement:
         _warn(
@@ -396,8 +432,9 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
             f"subdivision to look right).")
 
     core.get_logger(_app_dir()).info(
-        f"[TextureAutoloader] Material '{mat_name}' applied to {obj.name} "
-        f"with {len(channel_files)} channel(s) requested.")
+        f"[TextureAutoloader] Material '{mat.name}' applied to {obj.name} "
+        f"with {len(result['wired'])} of {len(channel_files)} channel(s) wired.")
+    return result
 
 
 # ══════════════════════════════════════════════════════════════
@@ -683,16 +720,37 @@ class TEXTUREAUTOLOADER_OT_apply_all(Operator):
                 {'INFO'},
                 _t("dialog_existing_materials_body", count=len(conflicts)).replace("\n\n", " "))
 
-        def _apply_one(obj_name: str, mat_basename: str, channel_files: Dict[str, str]) -> None:
-            process_textures(obj_name, mat_basename, channel_files, config)
+        def _apply_one(obj_name: str, mat_basename: str,
+                       channel_files: Dict[str, str]) -> Dict[str, Any]:
+            return process_textures(obj_name, mat_basename, channel_files, config)
 
         applied, skipped = core.apply_auto_textures(
             _MATCHES, config, apply_one_fn=_apply_one, log_fn=_log_print)
 
+        language = context.scene.texture_autoloader.language
+        text_name = _publish_report(core.build_report(_MATCHES, language, tex_map=_TEX_MAP))
         self.report(
             {'INFO'},
-            f"{_t('done_body_applied')}: {applied}    {_t('done_body_skipped')}: {skipped}")
+            f"{_t('done_body_applied')}: {applied}    {_t('done_body_skipped')}: {skipped}    "
+            f"{_t('report_in_text_editor', name=text_name)}")
         return {'FINISHED'}
+
+
+class TEXTUREAUTOLOADER_OT_show_report(Operator):
+    bl_idname = "texture_autoloader.show_report"
+    bl_label = "Texture Autoloader — report"
+    bl_description = "Show the ✔/✘ report of the last run"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_popup(self, width=720)
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        for line in (_LAST_REPORT or "").splitlines():
+            col.label(text=line or " ")
 
 
 class TEXTUREAUTOLOADER_OT_manual_apply(Operator):
@@ -720,13 +778,19 @@ class TEXTUREAUTOLOADER_OT_manual_apply(Operator):
         if not file_paths:
             return {'CANCELLED'}
 
-        buckets, unmatched = core.bucket_files_by_type(file_paths, config["map_types"])
-        resolved = core.resolve_channel_files(buckets, config, warn_fn=_warn)
-        channel_files = {mid: fp for mid, (fp, _is_udim) in resolved.items()}
+        label = core.tex_base_name(os.path.basename(file_paths[0]), config["suffix_strip_list"])
+        entry = core.build_entry_from_files(obj.name, label, file_paths, config, warn_fn=_warn)
+        channel_files = {mid: ch["file"] for mid, ch in entry["channels"].items()}
+        try:
+            entry["result"] = process_textures(obj.name, obj.name, channel_files, config)
+            entry["status"] = "applied"
+        except Exception as e:
+            entry["status"], entry["error"] = "error", str(e)
 
-        process_textures(obj.name, obj.name, channel_files, config)
-        if unmatched:
-            self.report({'WARNING'}, f"{len(unmatched)} file(s) not recognized and not wired.")
+        text_name = _publish_report(
+            core.build_report([entry], context.scene.texture_autoloader.language))
+        self.report({'WARNING'} if entry["unrecognized"] or entry["status"] == "error" else {'INFO'},
+                    _t("report_in_text_editor", name=text_name))
         return {'FINISHED'}
 
 
@@ -842,6 +906,10 @@ class TEXTUREAUTOLOADER_PT_main(Panel):
 
         box.operator(TEXTUREAUTOLOADER_OT_apply_all.bl_idname,
                      text=core.tr(L, "btn_apply_all"), icon='PLAY')
+        if _LAST_REPORT:
+            box.label(text=_LAST_REPORT.splitlines()[-1])
+            box.operator(TEXTUREAUTOLOADER_OT_show_report.bl_idname,
+                         text=core.tr(L, "btn_show_report"), icon='TEXT')
 
         layout.separator()
         footer_row = layout.row()
@@ -867,6 +935,7 @@ _CLASSES = (
     TEXTUREAUTOLOADER_MT_reassign,
     TEXTUREAUTOLOADER_OT_open_reassign_menu,
     TEXTUREAUTOLOADER_OT_apply_all,
+    TEXTUREAUTOLOADER_OT_show_report,
     TEXTUREAUTOLOADER_OT_manual_apply,
     TEXTUREAUTOLOADER_PT_main,
 )

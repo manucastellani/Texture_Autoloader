@@ -138,6 +138,16 @@ def run():
                  for n in (cmds.listHistory(shader) or []) if cmds.nodeType(n) == "file"]
         check("Rock_Curvature.png" not in wired, "the unknown map type (Curvature) is not wired", failures)
 
+    # ── ✔/✘ report ──────────────────────────────────────────────
+    report = ta.core.build_report(matches, "en", tex_map=tex_map)
+    for expected in ("✔ Crate2048_BaseColor.<UDIM>.png → baseColor",
+                     "✔ Rock_Metallic.png → metallic",
+                     "✔ Rock_AO.png → ao",
+                     "– Rock_Height.png → displacement: not wired, displacement is opt-in",
+                     "✘ no match: Rock_Curvature.png",
+                     "2/2 object(s) applied"):
+        check(expected in report, f"report says: {expected}", failures)
+
     print()
     if failures:
         print(f"TAL_MAYA_TEST: FAILED ({len(failures)})")

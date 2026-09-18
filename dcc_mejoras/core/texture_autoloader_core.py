@@ -121,6 +121,28 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "select_files_dialog": "Select Substance textures",
         "lang_button": "ES",
         "lang_button_tooltip": "Switch UI language to Spanish",
+        # ── Report ──
+        "report_title": "TEXTURE AUTOLOADER — REPORT",
+        "report_title_preview": "TEXTURE AUTOLOADER — PREVIEW",
+        "report_no_set": "no texture set matched",
+        "report_no_match": "no match",
+        "report_error": "error",
+        "report_reason_disabled": "disabled in the preview",
+        "report_reason_displacement_off": (
+            "not wired, displacement is opt-in (enable_displacement_wiring)"),
+        "report_reason_no_target": "{target} has no input for this channel",
+        "report_reason_udim_unsupported": "UDIM isn't supported here yet",
+        "report_reason_not_wired": "not wired",
+        "report_reason_duplicate": "ignored, another {map_id} file is used",
+        "report_reason_unknown": "not used",
+        "report_status_cancelled": "not applied (batch cancelled)",
+        "report_status_no_channels": "not applied (all channels disabled)",
+        "report_unused_sets": "Texture sets with no object: {sets}",
+        "report_summary": (
+            "{applied}/{total} object(s) applied  ·  {ok} ✔  ·  {fail} ✘  ·  {skip} –"),
+        "done_body_report_hint": "Full report under “Show Details…” and in the Script Editor.",
+        "btn_show_report": "SHOW LAST REPORT",
+        "report_in_text_editor": "Full report in the Text Editor: “{name}”",
     },
     "es": {
         "app_title": "TEXTURE AUTOLOADER",
@@ -188,6 +210,28 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "select_files_dialog": "Seleccionar Texturas de Substance",
         "lang_button": "EN",
         "lang_button_tooltip": "Cambiar el idioma de la interfaz a inglés",
+        # ── Reporte ──
+        "report_title": "TEXTURE AUTOLOADER — REPORTE",
+        "report_title_preview": "TEXTURE AUTOLOADER — VISTA PREVIA",
+        "report_no_set": "ningún set de texturas coincide",
+        "report_no_match": "sin match",
+        "report_error": "error",
+        "report_reason_disabled": "desactivado en el preview",
+        "report_reason_displacement_off": (
+            "no se cablea, el displacement es opcional (enable_displacement_wiring)"),
+        "report_reason_no_target": "{target} no tiene un input para este canal",
+        "report_reason_udim_unsupported": "UDIM todavía no está soportado acá",
+        "report_reason_not_wired": "no se cableó",
+        "report_reason_duplicate": "ignorado, se usa otro archivo de {map_id}",
+        "report_reason_unknown": "no se usó",
+        "report_status_cancelled": "no se aplicó (se canceló el batch)",
+        "report_status_no_channels": "no se aplicó (todos los canales desactivados)",
+        "report_unused_sets": "Sets de texturas sin objeto: {sets}",
+        "report_summary": (
+            "{applied}/{total} objeto(s) aplicados  ·  {ok} ✔  ·  {fail} ✘  ·  {skip} –"),
+        "done_body_report_hint": "Reporte completo en “Show Details…” y en el Script Editor.",
+        "btn_show_report": "VER ÚLTIMO REPORTE",
+        "report_in_text_editor": "Reporte completo en el Text Editor: “{name}”",
     },
 }
 
@@ -448,15 +492,28 @@ def _strip_trailing_modifiers(stem: str) -> str:
     return stem
 
 
-def tex_base_name(filename: str, suffix_strip_list: List[str]) -> str:
-    """Strips extension, modifiers, and map-type suffix -> the asset's base name."""
+def _split_tex_name(filename: str, suffix_strip_list: List[str]) -> Tuple[str, bool]:
+    """(asset base name, whether a known map-type suffix was stripped)."""
     stem = _strip_trailing_modifiers(os.path.splitext(filename)[0])
     for sfx in sorted(suffix_strip_list, key=len, reverse=True):
-        pattern = re.compile(rf'[_\-]{sfx}$', re.I)
+        pattern = re.compile(rf'[_\-]{re.escape(sfx)}$', re.I)
         if pattern.search(stem):
-            stem = pattern.sub('', stem)
-            break
-    return stem.strip('-_')
+            return pattern.sub('', stem).strip('-_'), True
+    return stem.strip('-_'), False
+
+
+def tex_base_name(filename: str, suffix_strip_list: List[str]) -> str:
+    """Strips extension, modifiers, and map-type suffix -> the asset's base name."""
+    return _split_tex_name(filename, suffix_strip_list)[0]
+
+
+def _owning_set(base: str, set_names: List[str]) -> Optional[str]:
+    """The longest known set name that `base` starts with, followed by a
+    separator ("Rock" for "Rock_Curvature"), or None."""
+    lowered = base.lower()
+    owners = [s for s in set_names
+              if lowered.startswith(s.lower() + "_") or lowered.startswith(s.lower() + "-")]
+    return max(owners, key=len) if owners else None
 
 
 def mesh_base_name(obj: str, mesh_prefixes: List[str]) -> str:
@@ -510,16 +567,30 @@ def similarity(a: str, b: str) -> float:
 def scan_texture_folder(folder: str, suffix_strip_list: List[str],
                          extensions: Optional[set] = None,
                          recursive: bool = False) -> Dict[str, List[str]]:
-    """Returns { tex_base: [filepath, filepath, ...] }."""
+    """Returns { tex_base: [filepath, filepath, ...] }.
+
+    A file whose map-type suffix isn't in `suffix_strip_list`
+    ("Rock_Curvature.png") joins the longest known set its name starts
+    with ("Rock") instead of becoming a texture set of its own — that way
+    it shows up as "no match" in that set's report, next to the maps that
+    did get wired, rather than as a phantom set nobody asked for."""
     exts = extensions or _EXTS
     result: Dict[str, List[str]] = {}
+    unknown_suffix: List[Tuple[str, str]] = []
     walker = os.walk(folder) if recursive else [(folder, [], os.listdir(folder))]
     for root, _dirs, files in walker:
         for fname in files:
             if os.path.splitext(fname)[1].lower() not in exts:
                 continue
-            base = tex_base_name(fname, suffix_strip_list)
-            result.setdefault(base, []).append(os.path.join(root, fname))
+            base, known = _split_tex_name(fname, suffix_strip_list)
+            path = os.path.join(root, fname)
+            if known:
+                result.setdefault(base, []).append(path)
+            else:
+                unknown_suffix.append((base, path))
+    for base, path in unknown_suffix:
+        owner = _owning_set(base, list(result))
+        result.setdefault(owner or base, []).append(path)
     return result
 
 
@@ -656,23 +727,47 @@ def build_match_entry(obj: str, tex_base: Optional[str], score: float,
                        ) -> Dict[str, Any]:
     """Builds the per-object data structure used by the channel tree/list
     in the UI: which map types were detected for the matched set, with
-    which file, and whether they're enabled (all enabled by default)."""
+    which file, and whether they're enabled (all enabled by default).
+
+    Also keeps what did NOT make it into a channel, for the report:
+    `unrecognized` (files of the set whose map type isn't known) and, per
+    channel, `ignored` (other files of the same type that lost to the one
+    in use — e.g. a second resolution of the same map)."""
+    files = tex_map.get(tex_base, []) if tex_base else []
+    entry = build_entry_from_files(obj, tex_base, files, config, warn_fn=warn_fn)
+    entry["score"] = score
+    return entry
+
+
+def build_entry_from_files(obj: str, tex_base: Optional[str], file_paths: List[str],
+                            config: Dict[str, Any],
+                            warn_fn: Optional[Callable[[str], None]] = None
+                            ) -> Dict[str, Any]:
+    """Same structure as build_match_entry, from an explicit file list —
+    what the front-ends' manual mode (files picked by hand) uses so that it
+    gets the same report as the Auto-Loader."""
     channels: Dict[str, Dict[str, Any]] = {}
-    if tex_base and tex_base in tex_map:
-        buckets, _unmatched = bucket_files_by_type(tex_map[tex_base], config["map_types"])
+    unrecognized: List[str] = []
+    if file_paths:
+        buckets, unrecognized = bucket_files_by_type(file_paths, config["map_types"])
         resolved = resolve_channel_files(buckets, config, warn_fn=warn_fn)
         for map_id, (filepath, is_udim) in resolved.items():
+            typed_files = buckets[map_id]
+            used = (set(get_udim_tile_files(filepath, typed_files).values())
+                    if is_udim else {filepath})
             channels[map_id] = {
                 "enabled": True,
                 "file": filepath,
                 "is_udim": is_udim,
                 "overridden": False,
+                "ignored": [f for f in typed_files if f not in used],
             }
     return {
         "obj": obj,
         "tex_base": tex_base,
-        "score": score,
+        "score": 1.0 if tex_base else 0.0,
         "channels": channels,
+        "unrecognized": list(unrecognized),
     }
 
 
@@ -701,27 +796,51 @@ def match_objects_to_textures(object_entries: List[Tuple[str, Optional[str]]],
         lacking a material.
     """
     mesh_prefixes = config["mesh_prefixes"]
-    threshold = config["match_threshold"]
 
-    obj_names = [name for name, _material in object_entries]
-    obj_bases: List[str] = []
+    named_entries: List[Tuple[str, str]] = []
     for name, assigned_material in object_entries:
         base = None
         if match_mode == "material_id" and assigned_material:
             base = material_base_name(assigned_material, mesh_prefixes)
         if not base:
             base = mesh_base_name(name, mesh_prefixes)
-        obj_bases.append(base)
+        named_entries.append((name, base))
 
-    pure_results = compute_matches(obj_bases, list(tex_map.keys()), threshold)
+    return match_names_to_textures(named_entries, tex_map, config, warn_fn=warn_fn)
 
-    return [build_match_entry(obj, tex_base, score, tex_map, config, warn_fn=warn_fn)
-            for obj, (_base, tex_base, score) in zip(obj_names, pure_results)]
+
+def match_names_to_textures(named_entries: List[Tuple[str, str]],
+                             tex_map: Dict[str, List[str]],
+                             config: Dict[str, Any],
+                             warn_fn: Optional[Callable[[str], None]] = None
+                             ) -> List[Dict[str, Any]]:
+    """Lower-level matching for front-ends that decide by themselves which
+    name stands for each thing to match: `named_entries` is a list of
+    (key, logical_name) pairs, and each resulting entry carries "obj" =
+    key. The Unreal port uses it to match Material Slots (one mesh can
+    need several texture sets), not whole objects."""
+    pure_results = compute_matches([name for _key, name in named_entries],
+                                   list(tex_map.keys()), config["match_threshold"])
+    return [build_match_entry(key, tex_base, score, tex_map, config, warn_fn=warn_fn)
+            for (key, _name), (_base, tex_base, score) in zip(named_entries, pure_results)]
+
+
+def new_apply_result(material: Optional[str] = None) -> Dict[str, Any]:
+    """What a front-end's apply function returns for one object, so the
+    report can say what happened to each channel:
+
+      wired   {map_id: file}               — connected / bound
+      skipped {map_id: {"reason": ..., **}} — deliberately not used;
+              reason is a "report_reason_<reason>" translation key and the
+              other keys are its placeholders
+      failed  {map_id: "error message"}    — tried and failed
+    """
+    return {"material": material, "wired": {}, "skipped": {}, "failed": {}}
 
 
 def apply_auto_textures(matches: List[Dict[str, Any]],
                          config: Dict[str, Any],
-                         apply_one_fn: Callable[[str, str, Dict[str, str]], None],
+                         apply_one_fn: Callable[[str, str, Dict[str, str]], Optional[Dict[str, Any]]],
                          progress_cb: Optional[Callable[[int, int, str], bool]] = None,
                          log_fn: Optional[Callable[[str], None]] = None
                          ) -> Tuple[int, int]:
@@ -729,24 +848,48 @@ def apply_auto_textures(matches: List[Dict[str, Any]],
     For each matched object, applies only the enabled channels (respects
     the checkboxes/overrides from the UI). `apply_one_fn(obj, mat_basename,
     channel_files)` is supplied by the DCC wrapper and does the actual
-    scene work (create the shader, wire the textures). `progress_cb(i,
-    total, obj)` may return True to cancel the batch partway through.
+    scene work (create the shader, wire the textures); if it returns a
+    new_apply_result() dict, the report uses it. `progress_cb(i, total,
+    obj)` may return True to cancel the batch partway through.
+
+    Each match gets a "status" ("applied", "no_match", "no_channels",
+    "error" or "cancelled") and, when applied, a "result". An exception
+    while applying one object is recorded as that object's error and the
+    batch moves on to the next one instead of aborting halfway.
     """
     applied = skipped = 0
     total = len(matches)
+    for m in matches:
+        m["status"] = "cancelled"
+        m.pop("result", None)
+        m.pop("error", None)
     for i, m in enumerate(matches):
         if progress_cb and progress_cb(i, total, m["obj"]):
             break
         if not m["tex_base"]:
+            m["status"] = "no_match"
             skipped += 1
             continue
         channel_files = {mid: ch["file"] for mid, ch in m["channels"].items() if ch["enabled"]}
         if not channel_files:
+            m["status"] = "no_channels"
             skipped += 1
             continue
         if log_fn:
             log_fn(f"[TextureAutoloader] Applying {len(channel_files)} channel(s) to: {m['obj']}")
-        apply_one_fn(m["obj"], mesh_base_name(m["obj"], config["mesh_prefixes"]), channel_files)
+        try:
+            result = apply_one_fn(
+                m["obj"], mesh_base_name(m["obj"], config["mesh_prefixes"]), channel_files)
+        except Exception as e:
+            m["status"] = "error"
+            m["error"] = str(e) or e.__class__.__name__
+            skipped += 1
+            if log_fn:
+                log_fn(f"[TextureAutoloader] ERROR applying {m['obj']}: {m['error']}")
+            continue
+        m["status"] = "applied"
+        if isinstance(result, dict):
+            m["result"] = result
         applied += 1
     if progress_cb:
         progress_cb(total, total, "")
@@ -755,3 +898,122 @@ def apply_auto_textures(matches: List[Dict[str, Any]],
             f"[TextureAutoloader] Auto-Loader batch complete — {applied} object(s) applied, "
             f"{skipped} skipped out of {total} total.")
     return applied, skipped
+
+
+# ══════════════════════════════════════════════════════════════
+#  REPORT — texto plano post-ejecución (✔ / ✘ / –), compartido por
+#  Maya, Blender y Unreal. Sin thumbnails a propósito: un reporte de
+#  texto dice qué pasó con cada archivo sin sumar complejidad de UI.
+# ══════════════════════════════════════════════════════════════
+
+REPORT_OK = "✔"      # wired / bound
+REPORT_FAIL = "✘"    # found but not used: no match, no target, error
+REPORT_SKIP = "–"    # intentionally not used: disabled, opt-in, duplicate
+
+# Skip reasons that are a deliberate choice (shown as "–", not as a
+# failure). Anything else a front-end skips — e.g. a renderer or master
+# material with no input for that channel — is something to fix, so ✘.
+_INTENTIONAL_SKIP_REASONS = {"displacement_off"}
+
+
+def _report_file_label(file_path: str, is_udim: bool = False) -> str:
+    name = os.path.basename(file_path)
+    return name + ("  (UDIM)" if is_udim and "<UDIM>" not in name else "")
+
+
+def _reason_text(language: str, skipped: Any) -> str:
+    if isinstance(skipped, dict):
+        args = {k: v for k, v in skipped.items() if k != "reason"}
+        return tr(language, f"report_reason_{skipped.get('reason', 'unknown')}", **args)
+    return str(skipped)
+
+
+def build_report(matches: List[Dict[str, Any]], language: str = DEFAULT_LANGUAGE,
+                 tex_map: Optional[Dict[str, List[str]]] = None,
+                 preview: bool = False) -> str:
+    """Plain-text report of a batch, one block per object:
+
+        SM_Rock  →  Rock  (95%)  ·  M_Rock_MAT
+          ✔ Rock_BaseColor.png → baseColor
+          – Rock_Height.png → displacement: not wired, displacement is opt-in
+          ✘ no match: Rock_Curvature.png
+
+    With preview=True (before applying) channels are listed as planned
+    ("•") instead of ✔/✘. If `tex_map` is given, texture sets that no
+    object used are listed at the end."""
+    L = language
+    lines = [tr(L, "report_title_preview" if preview else "report_title"), ""]
+    counts = {"ok": 0, "fail": 0, "skip": 0}
+
+    def add(symbol: str, text: str, kind: str) -> None:
+        lines.append(f"    {symbol} {text}")
+        counts[kind] += 1
+
+    for m in matches:
+        name = m["obj"].split("|")[-1]
+        if not m.get("tex_base"):
+            lines.append(f"{name}  →  {REPORT_FAIL} {tr(L, 'report_no_set')}")
+            counts["fail"] += 1
+            continue
+
+        result = m.get("result") or {}
+        header = f"{name}  →  {m['tex_base']}  ({m.get('score', 0.0):.0%})"
+        if result.get("material"):
+            header += f"  ·  {result['material']}"
+        lines.append(header)
+
+        status = m.get("status")
+        if not preview and status in ("cancelled", "no_channels", "error"):
+            if status == "error":
+                add(REPORT_FAIL, f"{tr(L, 'report_error')}: {m.get('error', '')}", "fail")
+            else:
+                add(REPORT_SKIP, tr(L, f"report_status_{status}"), "skip")
+            continue
+
+        wired = result.get("wired", {})
+        failed = result.get("failed", {})
+        skipped = result.get("skipped", {})
+        for map_id, ch in m["channels"].items():
+            label = f"{_report_file_label(ch['file'], ch.get('is_udim', False))} → {map_id}"
+            if not ch["enabled"]:
+                add(REPORT_SKIP, f"{label}: {tr(L, 'report_reason_disabled')}", "skip")
+            elif preview:
+                lines.append(f"    • {label}")
+            elif map_id in wired:
+                add(REPORT_OK, label, "ok")
+            elif map_id in failed:
+                add(REPORT_FAIL, f"{label}: {tr(L, 'report_error')}: {failed[map_id]}", "fail")
+            elif map_id in skipped:
+                reason = skipped[map_id]
+                intentional = (isinstance(reason, dict)
+                               and reason.get("reason") in _INTENTIONAL_SKIP_REASONS)
+                add(REPORT_SKIP if intentional else REPORT_FAIL,
+                    f"{label}: {_reason_text(L, reason)}", "skip" if intentional else "fail")
+            elif result:
+                add(REPORT_FAIL, f"{label}: {tr(L, 'report_reason_not_wired')}", "fail")
+            else:
+                # The front-end didn't report per-channel results: all we
+                # know is that the object was applied with these channels.
+                add(REPORT_OK, label, "ok")
+            for ignored in ch.get("ignored", []):
+                add(REPORT_SKIP, f"{os.path.basename(ignored)}: "
+                    f"{tr(L, 'report_reason_duplicate', map_id=map_id)}", "skip")
+        for f in m.get("unrecognized", []):
+            add(REPORT_FAIL, f"{tr(L, 'report_no_match')}: {os.path.basename(f)}", "fail")
+
+    if tex_map:
+        used = {m.get("tex_base") for m in matches}
+        unused = [f"{name} ({len(files)})" for name, files in sorted(tex_map.items())
+                  if name not in used]
+        if unused:
+            lines += ["", tr(L, "report_unused_sets", sets=", ".join(unused))]
+
+    lines.append("")
+    if preview:
+        matched = sum(1 for m in matches if m.get("tex_base"))
+        lines.append(tr(L, "match_status", matched=matched, total=len(matches)))
+    else:
+        applied = sum(1 for m in matches if m.get("status") == "applied")
+        lines.append(tr(L, "report_summary", applied=applied, total=len(matches),
+                        ok=counts["ok"], fail=counts["fail"], skip=counts["skip"]))
+    return "\n".join(lines)
