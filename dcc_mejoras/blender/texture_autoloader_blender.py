@@ -47,7 +47,6 @@ bl_info = {
 import os
 import re
 import sys
-import glob
 from typing import Optional, List, Dict, Tuple, Any
 
 import bpy
@@ -177,14 +176,19 @@ def _udim_tiles_from_disk(representative_path: str) -> Dict[int, str]:
     """Dado un path con el token "<UDIM>", busca en disco los archivos
     reales de cada tile y devuelve {numero_de_tile: filepath}. Blender
     necesita registrar cada tile a mano (a diferencia de Arnold, que
-    resuelve el token <UDIM> por convención en el momento del render)."""
-    pattern = representative_path.replace("<UDIM>", "[0-9][0-9][0-9][0-9]")
-    tiles: Dict[int, str] = {}
-    for fp in glob.glob(pattern):
-        m = re.search(r'(\d{4})', os.path.basename(fp))
-        if m:
-            tiles[int(m.group(1))] = fp
-    return tiles
+    resuelve el token <UDIM> por convención en el momento del render).
+
+    El número de tile se lee en la posición del token (ver
+    core.get_udim_tile_files), no como "el primer grupo de 4 dígitos del
+    nombre": con eso, un asset como "Crate2048_BaseColor.1001.png" se
+    registraba como tile 2048."""
+    folder = os.path.dirname(representative_path)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return {}
+    return core.get_udim_tile_files(
+        representative_path, [os.path.join(folder, n) for n in names])
 
 
 def _load_image(file_path: str, is_udim: bool, colorspace: str) -> Optional["bpy.types.Image"]:

@@ -419,8 +419,11 @@ _FUZZ, HAS_RAPIDFUZZ = ensure_rapidfuzz()
 
 _EXTS = set(DEFAULT_CONFIG["texture_extensions"])
 
+# El separador incluye el punto porque Substance y Mari exportan los tiles
+# UDIM como "Wall_BaseColor.1001.png": sin el punto, cada tile quedaba
+# agrupado como un set distinto y el UDIM nunca llegaba a colapsarse.
 _TRAILING_MOD = re.compile(
-    r'[_\-](opengl|directx|dx|gl|tangent|world|object|space|'
+    r'[._\-](opengl|directx|dx|gl|tangent|world|object|space|'
     r'1k|2k|4k|8k|hi|lo|hd|sd|udim|\d{4})$', re.I)
 
 # Bounded to real UDIM tile numbers (1001-1999 = up to 10x10 tiles,

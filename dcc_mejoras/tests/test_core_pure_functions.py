@@ -69,6 +69,33 @@ def test_get_udim_tile_files_extracts_tile_numbers(core_module):
     }
 
 
+def test_tex_base_name_strips_udim_tile_with_dot_separator(core_module):
+    """Substance y Mari exportan los tiles como "Wall_BaseColor.1001.png"
+    (punto, no guion bajo). Sin sacar el ".1001" cada tile quedaba como un
+    set distinto ("Wall_BaseColor.1001", "Wall_BaseColor.1002", ...)."""
+    strip = core_module.DEFAULT_CONFIG["suffix_strip_list"]
+    assert core_module.tex_base_name("Wall_BaseColor.1001.png", strip) == "Wall"
+    assert core_module.tex_base_name("Wall_Normal.1002.exr", strip) == "Wall"
+    assert core_module.tex_base_name("Wall_BaseColor_1001.png", strip) == "Wall"
+
+
+def test_scan_and_match_collapse_dot_separated_udim_tiles(core_module, tmp_path):
+    for map_name in ("BaseColor", "Normal"):
+        for tile in (1001, 1002):
+            (tmp_path / f"Wall_{map_name}.{tile}.png").write_bytes(b"")
+
+    config = core_module.DEFAULT_CONFIG
+    tex_map = core_module.scan_texture_folder(str(tmp_path), config["suffix_strip_list"])
+    assert list(tex_map) == ["Wall"]
+
+    match = core_module.match_objects_to_textures([("SM_Wall", None)], tex_map, config)[0]
+    assert match["tex_base"] == "Wall"
+    for map_id, map_name in (("baseColor", "BaseColor"), ("normal", "Normal")):
+        channel = match["channels"][map_id]
+        assert channel["is_udim"] is True
+        assert channel["file"].endswith(f"Wall_{map_name}.<UDIM>.png")
+
+
 def test_bucket_files_by_type_first_match_wins_and_tracks_unmatched(core_module):
     files = ["/t/Wall_BaseColor.png", "/t/Wall_Roughness.png", "/t/Wall_Unknown.tiff"]
     buckets, unmatched = core_module.bucket_files_by_type(
