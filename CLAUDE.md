@@ -130,9 +130,11 @@ flujo de trabajo, por encima de la velocidad o la comodidad de editar.
 - README público: sacar la mención a thumbnails como "próximos pasos" (se descartaron)
   y documentar las mejoras nuevas y el port a Unreal.
 - Los fixes hechos en `dcc_mejoras/` también corrigen bugs que están en `main`: UDIM
-  con punto, número de tile en Blender, `.log` vacío (hacía fallar un test) y
-  displacement leído sin `alphaIsLuminance`. Hay que portarlos a `advanced/` y a los
-  standalone (`maya/`, `blender/`), que son copias a mano.
+  con punto, número de tile en Blender, `.log` vacío (hacía fallar un test),
+  displacement leído sin `alphaIsLuminance` y el selector de carpeta de Maya (al pegar
+  el script aceptaba cualquier carpeta; elegir `core/` "andaba" pero guardaba config /
+  state / log ahí). Hay que portarlos a `advanced/` y a los standalone (`maya/`,
+  `blender/`), que son copias a mano.
 - Decidir la estructura final: si `dcc_mejoras/` reemplaza a `advanced/` y si el port
   pasa a `advanced/unreal/` (hoy apunta a `../dcc_mejoras/core`).
 - Probar Redshift y V-Ray en un Maya con esos renderers antes de publicarlos.
