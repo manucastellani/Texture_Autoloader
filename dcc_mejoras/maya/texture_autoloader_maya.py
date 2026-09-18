@@ -36,7 +36,10 @@ v5.1 (dcc_mejoras, in testing):
   - Naming presets (Settings card) for studio suffix conventions.
   - Fixes: UDIM tiles named Name.1001.png were split into separate sets;
     opt-in displacement read outAlpha without alphaIsLuminance (constant
-    height on maps with no alpha channel).
+    height on maps with no alpha channel); when pasted into the Script
+    Editor, the folder picker accepted any folder (picking core/ "worked"
+    but saved config/state/log there) — it now finds the maya/ folder or
+    explains what to pick.
 
 v5.0 — Texture Autoloader:
   - Renamed from "Arnold Node Wrangler" to "Texture Autoloader" — the
@@ -125,6 +128,21 @@ except ImportError:
 
 _cached_this_dir: Optional[str] = None
 
+_MODULE_FILENAME = "texture_autoloader_maya.py"
+
+
+def _find_module_dir(picked: str) -> Optional[str]:
+    """La carpeta elegida en el diálogo tiene que ser la que contiene este
+    archivo. Se aceptan también las equivocaciones fáciles — la raíz del
+    build modular (advanced/ o dcc_mejoras/) o su carpeta core/ — porque
+    elegir core/ "funcionaba" (el core se importaba igual) pero dejaba
+    config/state/log guardados en la carpeta equivocada."""
+    for candidate in (picked, os.path.join(picked, "maya"),
+                      os.path.join(os.path.dirname(picked.rstrip("/\\")), "maya")):
+        if os.path.isfile(os.path.join(candidate, _MODULE_FILENAME)):
+            return os.path.normpath(candidate)
+    return None
+
 
 def _resolve_this_dir() -> str:
     global _cached_this_dir
@@ -141,19 +159,22 @@ def _resolve_this_dir() -> str:
     # pedimos al usuario, una sola vez, dónde está la carpeta del repo.
     result = cmds.fileDialog2(
         fileMode=3, dialogStyle=2,
-        caption="Texture Autoloader: select the 'maya' folder inside TextureAutoloader/advanced")
-    if not result:
+        caption="Texture Autoloader: select the 'maya' folder of the modular build "
+                "(TextureAutoloader/advanced/maya or dcc_mejoras/maya)")
+    module_dir = _find_module_dir(result[0]) if result else None
+    if not module_dir:
         raise RuntimeError(
             "Texture Autoloader could not locate its own folder (this happens when "
             "the script is pasted directly into the Script Editor instead of "
-            "imported). Either run it with:\n"
+            f"imported, and the folder picked doesn't contain {_MODULE_FILENAME}). "
+            "Either run it with:\n"
             "    import texture_autoloader_maya as ta\n"
             "    ta.create_ui()\n"
-            "(after adding the 'advanced/maya' folder to Maya's script path), or pick "
-            "the 'advanced/maya' folder in the dialog when prompted. If you just want "
+            "(after adding the build's 'maya' folder to Maya's script path), or pick "
+            "that 'maya' folder in the dialog when prompted. If you just want "
             "to paste-and-run with no dialog at all, use "
             "maya/texture_autoloader_maya_standalone.py instead.")
-    _cached_this_dir = result[0]
+    _cached_this_dir = module_dir
     return _cached_this_dir
 
 

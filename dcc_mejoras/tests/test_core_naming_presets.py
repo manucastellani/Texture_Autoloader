@@ -47,6 +47,18 @@ def test_short_suffixes_are_matched_at_the_end_of_the_name_only(core_module):
     assert classify("/t/Rock_Curvature.png", map_types) is None
 
 
+def test_short_suffixes_example_still_reads_a_standard_substance_export(core_module):
+    """Real case: picking the example preset for a regular export
+    (Modelado2_Cabeza_BaseColor.png, _Metalness, _Normal...) turned every
+    map but Emissive / Height into "no match"."""
+    map_types = _short(core_module)["map_types"]
+    expected = {"BaseColor": "baseColor", "Normal": "normal", "Roughness": "roughness",
+                "Metalness": "metallic", "Emissive": "emission", "Height": "displacement"}
+    for suffix, channel in expected.items():
+        assert core_module.classify_map_type(
+            f"/t/Modelado2_Cabeza_{suffix}.png", map_types) == channel, suffix
+
+
 def test_longest_suffix_wins(core_module):
     map_types = core_module.normalize_map_types([
         {"id": "baseColor", "suffixes": ["Base_Color"]},
@@ -76,7 +88,8 @@ def test_scan_and_match_with_a_preset(core_module, tmp_path):
 def test_list_naming_presets_puts_default_first_and_uses_labels(core_module):
     presets = core_module.list_naming_presets(core_module.DEFAULT_CONFIG, "es")
     assert presets[0] == ("default", "Por defecto (archivo de config)")
-    assert ("short_suffixes", "Short suffixes (_BC _N _R _M _AO _E _H _O)") in presets
+    assert [p for p, _label in presets] == ["default", "short_suffixes"]
+    assert presets[1][1].startswith("Short suffixes")
 
 
 def test_user_presets_are_read_from_the_config_file(core_module, app_dir):

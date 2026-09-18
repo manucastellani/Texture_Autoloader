@@ -384,17 +384,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Car_Rim_BC... as roughness just because it contains "_R". Color
     # space / raw are optional (sensible defaults per channel).
     "naming_preset": "default",
+    # The example also keeps Substance's standard names, so picking it for a
+    # regular export never turns BaseColor / Normal / Roughness into ✘.
     "naming_presets": {
         "short_suffixes": {
-            "label": "Short suffixes (_BC _N _R _M _AO _E _H _O)",
+            "label": "Short suffixes (_BC _N _R _M _AO _E _H _O) + standard names",
             "map_types": [
-                {"id": "baseColor", "suffixes": ["BC", "Albedo", "D"]},
-                {"id": "normal", "suffixes": ["N", "NRM"]},
-                {"id": "roughness", "suffixes": ["R", "Rough"]},
-                {"id": "metallic", "suffixes": ["M", "Metal"]},
-                {"id": "ao", "suffixes": ["AO"]},
-                {"id": "emission", "suffixes": ["E", "Emissive"]},
-                {"id": "displacement", "suffixes": ["H", "Height", "Disp"]},
+                {"id": "baseColor", "suffixes": ["BC", "D", "BaseColor", "Base_Color", "Albedo",
+                                                 "Diffuse"]},
+                {"id": "normal", "suffixes": ["N", "NRM", "Normal"]},
+                {"id": "roughness", "suffixes": ["R", "Rough", "Roughness"]},
+                {"id": "metallic", "suffixes": ["M", "Metal", "Metallic", "Metalness"]},
+                {"id": "ao", "suffixes": ["AO", "AmbientOcclusion", "Occlusion"]},
+                {"id": "emission", "suffixes": ["E", "Emissive", "Emission"]},
+                {"id": "displacement", "suffixes": ["H", "Height", "Disp", "Displacement"]},
                 {"id": "opacity", "suffixes": ["O", "Opacity", "Alpha"]},
             ],
         },
