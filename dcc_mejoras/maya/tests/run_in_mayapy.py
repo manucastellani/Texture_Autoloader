@@ -102,7 +102,17 @@ def run():
     try:
         return _run_checks(cmds, app, tmp)
     finally:
+        _close_tool_logs()  # an open .log file blocks deleting its folder on Windows
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _close_tool_logs():
+    import logging
+    for name, logger in list(logging.Logger.manager.loggerDict.items()):
+        if name.startswith("TextureAutoloader.") and isinstance(logger, logging.Logger):
+            for handler in list(logger.handlers):
+                handler.close()
+                logger.removeHandler(handler)
 
 
 def _run_checks(cmds, app, tmp):
