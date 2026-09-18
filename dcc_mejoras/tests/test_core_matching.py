@@ -34,6 +34,26 @@ def test_match_objects_to_textures_material_id_falls_back_to_object_name(core_mo
     assert matches[0]["tex_base"] == "NoMat"
 
 
+def test_match_names_to_textures_prefers_the_most_specific_candidate(core_module):
+    """A Material Slot "Body" on SM_Hero: with Hero_Body and Villain_Body
+    in the folder, "Body" alone ties — trying "Hero_Body" first doesn't."""
+    tex_map = {"Villain_Body": ["/t/Villain_Body_BaseColor.png"],
+               "Hero_Body": ["/t/Hero_Body_BaseColor.png"]}
+    entries = [("SM_Hero · Body", ["Hero_Body", "Body", "Hero"]),
+               ("SM_Villain · Body", ["Villain_Body", "Body", "Villain"])]
+    matches = core_module.match_names_to_textures(entries, tex_map, core_module.DEFAULT_CONFIG)
+    assert [m["tex_base"] for m in matches] == ["Hero_Body", "Villain_Body"]
+    assert matches[0]["obj"] == "SM_Hero · Body"
+
+
+def test_match_names_to_textures_keeps_single_names_and_threshold(core_module):
+    tex_map = {"Rock": ["/t/Rock_BaseColor.png"]}
+    matches = core_module.match_names_to_textures(
+        [("a", "Rock"), ("b", "Zzzz")], tex_map, core_module.DEFAULT_CONFIG)
+    assert matches[0]["tex_base"] == "Rock"
+    assert matches[1]["tex_base"] is None
+
+
 def test_build_match_entry_populates_channels_from_matched_set(core_module):
     tex_map = {"Rock": ["/tex/Rock_BaseColor.png", "/tex/Rock_Roughness.png"]}
     entry = core_module.build_match_entry(

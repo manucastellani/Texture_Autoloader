@@ -159,6 +159,11 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "{engine} needs the '{plugin}' plugin, which isn't loaded.\n\nLoad it now?"),
         "msg_engine_plugin_load_failed": "Could not load '{plugin}': {error}",
         "report_reason_missing_attr": "{target} has no '{attr}' attribute (other renderer version?)",
+        # ── Unreal ──
+        "report_reason_missing_param": "{target} has no texture parameter '{param}'",
+        "msg_select_meshes_unreal": (
+            "Select one or more Static Meshes or Skeletal Meshes in the Content Browser first."),
+        "msg_apply_question": "Create / update the Material Instances and assign them?",
     },
     "es": {
         "app_title": "TEXTURE AUTOLOADER",
@@ -264,6 +269,11 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "{engine} necesita el plugin '{plugin}', que no está cargado.\n\n¿Cargarlo ahora?"),
         "msg_engine_plugin_load_failed": "No se pudo cargar '{plugin}': {error}",
         "report_reason_missing_attr": "{target} no tiene el atributo '{attr}' (¿otra versión del renderer?)",
+        # ── Unreal ──
+        "report_reason_missing_param": "{target} no tiene el parámetro de textura '{param}'",
+        "msg_select_meshes_unreal": (
+            "Seleccioná primero uno o más Static Meshes o Skeletal Meshes en el Content Browser."),
+        "msg_apply_question": "¿Crear / actualizar los Material Instances y asignarlos?",
     },
 }
 
@@ -953,7 +963,7 @@ def match_objects_to_textures(object_entries: List[Tuple[str, Optional[str]]],
     return match_names_to_textures(named_entries, tex_map, config, warn_fn=warn_fn)
 
 
-def match_names_to_textures(named_entries: List[Tuple[str, str]],
+def match_names_to_textures(named_entries: List[Tuple[str, Any]],
                              tex_map: Dict[str, List[str]],
                              config: Dict[str, Any],
                              warn_fn: Optional[Callable[[str], None]] = None
@@ -962,11 +972,26 @@ def match_names_to_textures(named_entries: List[Tuple[str, str]],
     name stands for each thing to match: `named_entries` is a list of
     (key, logical_name) pairs, and each resulting entry carries "obj" =
     key. The Unreal port uses it to match Material Slots (one mesh can
-    need several texture sets), not whole objects."""
-    pure_results = compute_matches([name for _key, name in named_entries],
-                                   list(tex_map.keys()), config["match_threshold"])
-    return [build_match_entry(key, tex_base, score, tex_map, config, warn_fn=warn_fn)
-            for (key, _name), (_base, tex_base, score) in zip(named_entries, pure_results)]
+    need several texture sets), not whole objects.
+
+    logical_name can also be a list of candidate names, most specific
+    first: the best score over all of them wins, and on a tie the earlier
+    candidate keeps it. A slot "Body" on SM_Hero tries "Hero_Body" before
+    "Body", so a folder with Hero_Body and Villain_Body maps it right."""
+    tex_bases = list(tex_map.keys())
+    threshold = config["match_threshold"]
+    entries = []
+    for key, names in named_entries:
+        candidates = [names] if isinstance(names, str) else list(names)
+        best_base, best_score = None, 0.0
+        for _name, tex_base, score in compute_matches(candidates, tex_bases, 0.0):
+            if tex_base is not None and score > best_score:
+                best_base, best_score = tex_base, score
+        if best_score < threshold:
+            best_base = None
+        entries.append(build_match_entry(key, best_base, best_score, tex_map, config,
+                                         warn_fn=warn_fn))
+    return entries
 
 
 def new_apply_result(material: Optional[str] = None) -> Dict[str, Any]:
