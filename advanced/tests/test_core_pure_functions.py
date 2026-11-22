@@ -70,9 +70,9 @@ def test_get_udim_tile_files_extracts_tile_numbers(core_module):
 
 
 def test_tex_base_name_strips_udim_tile_with_dot_separator(core_module):
-    """Substance and Mari export tiles as "Wall_BaseColor.1001.png" (dot, not
-    underscore). Without stripping the ".1001" every tile became its own
-    texture set, so a mesh matched a single tile and UDIM never collapsed."""
+    """Substance y Mari exportan los tiles como "Wall_BaseColor.1001.png"
+    (punto, no guion bajo). Sin sacar el ".1001" cada tile quedaba como un
+    set distinto ("Wall_BaseColor.1001", "Wall_BaseColor.1002", ...)."""
     strip = core_module.DEFAULT_CONFIG["suffix_strip_list"]
     assert core_module.tex_base_name("Wall_BaseColor.1001.png", strip) == "Wall"
     assert core_module.tex_base_name("Wall_Normal.1002.exr", strip) == "Wall"
@@ -115,8 +115,8 @@ def test_similarity_is_1_for_the_same_name_however_it_is_written(core_module):
 
 
 def test_similarity_still_tolerates_typos(core_module):
-    """What the fuzzy ratio is actually for: "brazos" vs a set exported as
-    "Braxos". Neither a word nor a substring match, so it must not be capped."""
+    """What the fuzzy ratio is for: "brazos" vs a set exported as "Braxos".
+    Neither a word nor a substring match, so it must not be capped."""
     assert core_module.similarity("brazos", "Braxos") > 0.60
 
 

@@ -1,13 +1,15 @@
 """
-Texture Autoloader — Maya / Arnold front-end
-=============================================
+Texture Autoloader — Maya front-end (Arnold / Redshift / V-Ray)
+================================================================
 Author: Manuel Castellani
-Desc  : Substance texture auto-loader for Maya/Arnold. Scans a folder,
+Desc  : Substance texture auto-loader for Maya. Scans a folder,
         matches meshes to texture sets by name (fuzzy matching), and
-        wires a new aiStandardSurface per object.
+        wires a new shader per object for the chosen render engine —
+        aiStandardSurface, RedshiftStandardMaterial or VRayMtl (see
+        ENGINE_TEMPLATES).
 
 This file only contains what's genuinely specific to Maya: the actual
-Arnold shading-node wiring, and the Qt/PySide UI. All naming/matching
+shading-node wiring, and the Qt/PySide UI. All naming/matching
 logic (string normalization, fuzzy matching, UDIM collapsing, config and
 state persistence, and the EN/ES translation table) lives in
 `core/texture_autoloader_core.py`, one folder up, shared with the
@@ -25,7 +27,21 @@ no `core/` dependency at all.
 Changelog (this tool used to be a single Maya-only script called
 "Arnold Node Wrangler"; the version history below is kept for context):
 
-v5.0 — Texture Autoloader (this file):
+v5.1 (dcc_mejoras, in testing):
+  - Render engine selector: Arnold, Redshift or V-Ray, as one template
+    per engine (ENGINE_TEMPLATES) instead of hardcoded Arnold wiring.
+    Every attribute is checked before connecting.
+  - ✔/✘ report after every run (done dialog "Show Details…" + Script
+    Editor), manual mode included.
+  - Naming presets (Settings card) for studio suffix conventions.
+  - Fixes: UDIM tiles named Name.1001.png were split into separate sets;
+    opt-in displacement read outAlpha without alphaIsLuminance (constant
+    height on maps with no alpha channel); when pasted into the Script
+    Editor, the folder picker accepted any folder (picking core/ "worked"
+    but saved config/state/log there) — it now finds the maya/ folder or
+    explains what to pick.
+
+v5.0 — Texture Autoloader:
   - Renamed from "Arnold Node Wrangler" to "Texture Autoloader" — the
     name now describes what the tool does rather than a single renderer,
     which matters now that the same logic also ships as a Blender addon.
@@ -76,6 +92,7 @@ pattern on repeated UVs).
 ---------------------------------------------------------------------
 """
 
+import html
 import os
 import sys
 from typing import Optional, List, Dict, Tuple, Any
@@ -111,6 +128,21 @@ except ImportError:
 
 _cached_this_dir: Optional[str] = None
 
+_MODULE_FILENAME = "texture_autoloader_maya.py"
+
+
+def _find_module_dir(picked: str) -> Optional[str]:
+    """La carpeta elegida en el diálogo tiene que ser la que contiene este
+    archivo. Se aceptan también las equivocaciones fáciles — la raíz del
+    build modular (advanced/ o dcc_mejoras/) o su carpeta core/ — porque
+    elegir core/ "funcionaba" (el core se importaba igual) pero dejaba
+    config/state/log guardados en la carpeta equivocada."""
+    for candidate in (picked, os.path.join(picked, "maya"),
+                      os.path.join(os.path.dirname(picked.rstrip("/\\")), "maya")):
+        if os.path.isfile(os.path.join(candidate, _MODULE_FILENAME)):
+            return os.path.normpath(candidate)
+    return None
+
 
 def _resolve_this_dir() -> str:
     global _cached_this_dir
@@ -127,19 +159,22 @@ def _resolve_this_dir() -> str:
     # pedimos al usuario, una sola vez, dónde está la carpeta del repo.
     result = cmds.fileDialog2(
         fileMode=3, dialogStyle=2,
-        caption="Texture Autoloader: select the 'maya' folder inside TextureAutoloader/advanced")
-    if not result:
+        caption="Texture Autoloader: select the 'maya' folder of the modular build "
+                "(TextureAutoloader/advanced/maya or dcc_mejoras/maya)")
+    module_dir = _find_module_dir(result[0]) if result else None
+    if not module_dir:
         raise RuntimeError(
             "Texture Autoloader could not locate its own folder (this happens when "
             "the script is pasted directly into the Script Editor instead of "
-            "imported). Either run it with:\n"
+            f"imported, and the folder picked doesn't contain {_MODULE_FILENAME}). "
+            "Either run it with:\n"
             "    import texture_autoloader_maya as ta\n"
             "    ta.create_ui()\n"
-            "(after adding the 'advanced/maya' folder to Maya's script path), or pick "
-            "the 'advanced/maya' folder in the dialog when prompted. If you just want "
+            "(after adding the build's 'maya' folder to Maya's script path), or pick "
+            "that 'maya' folder in the dialog when prompted. If you just want "
             "to paste-and-run with no dialog at all, use "
             "maya/texture_autoloader_maya_standalone.py instead.")
-    _cached_this_dir = result[0]
+    _cached_this_dir = module_dir
     return _cached_this_dir
 
 
@@ -304,62 +339,173 @@ def _cleanup_existing_material(obj: str) -> int:
         return 0
 
 
-# Tipos de mapa que esta función sabe cablear. Un `map_types` extendido a mano
-# en el config (algo que el README invita a hacer) puede traer ids que acá no
-# existen: antes se creaba el nodo de textura igual y quedaba suelto en la
-# escena, sin conexión y sin aviso. Ver process_textures.
-WIRED_MAP_TYPES = frozenset({
-    "baseColor", "roughness", "metallic", "normal", "emission", "ao",
-    "displacement", "opacity",
-})
+# ══════════════════════════════════════════════════════════════
+#  MOTORES DE RENDER — una plantilla por motor: qué shader crear y a
+#  qué input va cada canal. Agregar un motor = agregar una entrada acá;
+#  el resto del cableado (nodos file, UDIM, color space, AO, reporte)
+#  es el mismo para todos.
+#
+#  Por canal:
+#    attr       input del shader al que llega el canal
+#    out        salida del nodo file: "color" (outColor), "alpha"
+#               (outAlpha) o "luminance" (outAlpha con alphaIsLuminance,
+#               para inputs float con mapas sin canal alpha)
+#    set        atributos del shader que se setean al cablear el canal
+#    node, node_kw, node_in, node_out, node_set
+#               nodo intermedio entre el file y el shader (normal map,
+#               displacement): el file entra por node_in y node_out va a
+#               `attr` — o, con
+#    sg_attr    ...a ese atributo del shading group (displacement)
+#    multiply_into
+#               AO: se multiplica sobre el input de ese canal (baseColor)
+#
+#  Las entradas de Redshift y V-Ray siguen los nombres de nodos y
+#  atributos documentados por cada renderer, pero no se pudieron probar
+#  en la máquina de desarrollo (sólo tiene Arnold). Cada atributo se
+#  verifica antes de conectar: si en tu versión del renderer un nombre no
+#  existe, el canal sale como ✘ en el reporte en vez de romper el batch.
+# ══════════════════════════════════════════════════════════════
+
+ENGINE_TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "arnold": {
+        "label": "Arnold  ·  aiStandardSurface",
+        "plugin": "mtoa",
+        "shader": "aiStandardSurface",
+        "channels": {
+            "baseColor": {"attr": "baseColor", "out": "color"},
+            "roughness": {"attr": "specularRoughness", "out": "luminance"},
+            "metallic": {"attr": "metalness", "out": "luminance"},
+            "emission": {"attr": "emissionColor", "out": "color", "set": {"emission": 1.0}},
+            "opacity": {"attr": "opacity", "out": "color"},
+            "normal": {"attr": "normalCamera", "node": "bump2d", "node_kw": {"asUtility": True},
+                       "node_in": "bumpValue", "out": "alpha", "node_out": "outNormal",
+                       "node_set": {"bumpInterp": 1}},  # 1 = tangent-space normals
+            "displacement": {"node": "displacementShader", "node_kw": {"asShader": True},
+                             "node_in": "displacement", "out": "luminance",
+                             "node_out": "displacement", "sg_attr": "displacementShader"},
+            "ao": {"multiply_into": "baseColor"},
+        },
+    },
+    "redshift": {
+        "label": "Redshift  ·  RedshiftStandardMaterial",
+        "plugin": "redshift4maya",
+        "shader": "RedshiftStandardMaterial",
+        "channels": {
+            "baseColor": {"attr": "base_color", "out": "color"},
+            "roughness": {"attr": "refl_roughness", "out": "luminance"},
+            "metallic": {"attr": "metalness", "out": "luminance"},
+            "emission": {"attr": "emission_color", "out": "color", "set": {"emission_weight": 1.0}},
+            "opacity": {"attr": "opacity_color", "out": "color"},
+            "normal": {"attr": "bump_input", "node": "RedshiftBumpMap", "node_kw": {"asUtility": True},
+                       "node_in": "input", "out": "color", "node_out": "out",
+                       "node_set": {"inputType": 1}},  # 1 = tangent-space normal
+            "displacement": {"node": "RedshiftDisplacement", "node_kw": {"asShader": True},
+                             "node_in": "texMap", "out": "color",
+                             "node_out": "out", "sg_attr": "displacementShader"},
+            "ao": {"multiply_into": "baseColor"},
+        },
+    },
+    "vray": {
+        "label": "V-Ray  ·  VRayMtl",
+        "plugin": "vrayformaya",
+        "shader": "VRayMtl",
+        # Metalness workflow: white reflection, GGX, glossiness read as roughness.
+        "shader_set": {"reflectionColor": (1.0, 1.0, 1.0), "brdfType": 3, "useRoughness": 1},
+        "channels": {
+            "baseColor": {"attr": "color", "out": "color"},
+            "roughness": {"attr": "reflectionGlossiness", "out": "luminance"},
+            "metallic": {"attr": "metalness", "out": "luminance"},
+            "emission": {"attr": "illumColor", "out": "color"},
+            "opacity": {"attr": "opacityMap", "out": "color"},
+            "normal": {"attr": "bumpMap", "out": "color",
+                       "set": {"bumpMapType": 1}},  # 1 = normal map in tangent space
+            "displacement": {"node": "displacementShader", "node_kw": {"asShader": True},
+                             "node_in": "displacement", "out": "luminance",
+                             "node_out": "displacement", "sg_attr": "displacementShader"},
+            "ao": {"multiply_into": "baseColor"},
+        },
+    },
+}
+
+DEFAULT_ENGINE = "arnold"
+
+# Config de disco de la versión de Maya: la del core + el motor por defecto.
+MAYA_DEFAULT_CONFIG: Dict[str, Any] = dict(core.DEFAULT_CONFIG, render_engine=DEFAULT_ENGINE)
 
 
-def _wire_map_type(map_id: str, fn: str, mat_name: str, sg_name: str,
-                    created_nodes: Dict[str, str], stem: str) -> None:
-    """Cablea un nodo de textura ya creado según el tipo de mapa detectado."""
-    if map_id == "baseColor":
-        cmds.connectAttr(f"{fn}.outColor", f"{mat_name}.baseColor", force=True)
-        created_nodes['baseColor'] = fn
+def _load_config() -> Dict[str, Any]:
+    return core.load_config(_app_dir(), warn_fn=_warn, defaults=MAYA_DEFAULT_CONFIG)
 
-    elif map_id == "roughness":
-        cmds.setAttr(f"{fn}.alphaIsLuminance", True)
-        cmds.connectAttr(f"{fn}.outAlpha", f"{mat_name}.specularRoughness", force=True)
 
-    elif map_id == "metallic":
-        cmds.setAttr(f"{fn}.alphaIsLuminance", True)
-        cmds.connectAttr(f"{fn}.outAlpha", f"{mat_name}.metalness", force=True)
+def engine_plugin_loaded(engine: str) -> bool:
+    try:
+        return bool(cmds.pluginInfo(ENGINE_TEMPLATES[engine]["plugin"], query=True, loaded=True))
+    except Exception:
+        return False
 
-    elif map_id == "normal":
-        bump_node = cmds.shadingNode('bump2d', asUtility=True, name=f"{stem}_bump2d")
-        cmds.setAttr(f"{bump_node}.bumpInterp", 1)  # Tangent Space
+
+def _has_attr(node: str, attr: str) -> bool:
+    try:
+        return bool(cmds.attributeQuery(attr, node=node, exists=True))
+    except Exception:
+        return False
+
+
+def _set_attrs(node: str, values: Dict[str, Any]) -> None:
+    for attr, value in values.items():
+        if not _has_attr(node, attr):
+            continue
+        if isinstance(value, (tuple, list)):
+            cmds.setAttr(f"{node}.{attr}", *value, type="double3")
+        else:
+            cmds.setAttr(f"{node}.{attr}", value)
+
+
+def _connect_file(file_node: str, dest: str, out: str) -> None:
+    if out == "luminance":
+        cmds.setAttr(f"{file_node}.alphaIsLuminance", True)
+    if out in ("alpha", "luminance"):
         try:
-            cmds.connectAttr(f"{fn}.outAlpha", f"{bump_node}.bumpValue", force=True)
+            cmds.connectAttr(f"{file_node}.outAlpha", dest, force=True)
         except Exception:
-            cmds.connectAttr(f"{fn}.outColorR", f"{bump_node}.bumpValue", force=True)
-        cmds.connectAttr(f"{bump_node}.outNormal", f"{mat_name}.normalCamera", force=True)
+            cmds.connectAttr(f"{file_node}.outColorR", dest, force=True)
+    else:
+        cmds.connectAttr(f"{file_node}.outColor", dest, force=True)
 
-    elif map_id == "emission":
-        cmds.setAttr(f"{mat_name}.emission", 1.0)
-        cmds.connectAttr(f"{fn}.outColor", f"{mat_name}.emissionColor", force=True)
 
-    elif map_id == "ao":
-        created_nodes['ao'] = fn
+def _wire_channel(engine: str, map_id: str, file_node: str, mat_name: str, sg_name: str,
+                  stem: str) -> Optional[Dict[str, Any]]:
+    """Cablea un nodo file ya creado según la plantilla del motor.
+    Devuelve None si quedó cableado, o el motivo (para el reporte) si el
+    motor no tiene dónde conectarlo."""
+    template = ENGINE_TEMPLATES[engine]
+    spec = template["channels"].get(map_id)
+    if spec is None or "multiply_into" in spec:
+        return {"reason": "no_target", "target": template["shader"]}
 
-    elif map_id == "displacement":
-        disp_node = cmds.shadingNode('displacementShader', asShader=True,
-                                      name=f"{stem}_dispShader")
-        # alphaIsLuminance, igual que en roughness/metallic: un height export
-        # no trae canal alfa, así que sin esto outAlpha es 1.0 constante y el
-        # objeto se infla uniforme en vez de seguir el mapa.
-        cmds.setAttr(f"{fn}.alphaIsLuminance", True)
-        try:
-            cmds.connectAttr(f"{fn}.outAlpha", f"{disp_node}.displacement", force=True)
-        except Exception:
-            cmds.connectAttr(f"{fn}.outColorR", f"{disp_node}.displacement", force=True)
-        cmds.connectAttr(f"{disp_node}.displacement", f"{sg_name}.displacementShader", force=True)
+    source = None
+    if "node" in spec:
+        helper = cmds.shadingNode(spec["node"], name=f"{stem}_{spec['node']}", **spec["node_kw"])
+        missing = [a for a in (spec["node_in"], spec["node_out"]) if not _has_attr(helper, a)]
+        if missing:
+            cmds.delete(helper)
+            return {"reason": "missing_attr", "target": spec["node"], "attr": missing[0]}
+        _set_attrs(helper, spec.get("node_set", {}))
+        _connect_file(file_node, f"{helper}.{spec['node_in']}", spec["out"])
+        if "sg_attr" in spec:
+            cmds.connectAttr(f"{helper}.{spec['node_out']}", f"{sg_name}.{spec['sg_attr']}",
+                             force=True)
+            return None
+        source = f"{helper}.{spec['node_out']}"
 
-    elif map_id == "opacity":
-        cmds.connectAttr(f"{fn}.outColor", f"{mat_name}.opacity", force=True)
+    if not _has_attr(mat_name, spec["attr"]):
+        return {"reason": "missing_attr", "target": template["shader"], "attr": spec["attr"]}
+    _set_attrs(mat_name, spec.get("set", {}))
+    if source:
+        cmds.connectAttr(source, f"{mat_name}.{spec['attr']}", force=True)
+    else:
+        _connect_file(file_node, f"{mat_name}.{spec['attr']}", spec["out"])
+    return None
 
 
 def get_selected_mesh() -> Optional[str]:
@@ -370,50 +516,83 @@ def get_selected_mesh() -> Optional[str]:
     return selection[0]
 
 
-def load_textures_and_apply(config: Optional[Dict[str, Any]] = None) -> None:
-    config = config or core.load_config(_app_dir(), warn_fn=_warn)
+def load_textures_and_apply(config: Optional[Dict[str, Any]] = None,
+                            language: str = core.DEFAULT_LANGUAGE,
+                            engine: Optional[str] = None) -> Optional[str]:
+    """Modo manual: aplica archivos elegidos a mano al objeto seleccionado.
+    Devuelve el reporte ✔/✘ (o None si se canceló la selección)."""
+    config = config or _load_config()
     selected_obj = get_selected_mesh()
     if not selected_obj:
-        return
+        return None
     file_paths = cmds.fileDialog2(
         fileMode=4, dialogStyle=2,
-        caption="Seleccionar Texturas de Substance",
+        caption=core.tr(language, "select_files_dialog"),
         fileFilter="Images (*.png *.jpg *.jpeg *.tga *.exr *.tif *.tiff)"
     )
     if not file_paths:
-        return
+        return None
+
+    label = core.tex_base_name(os.path.basename(file_paths[0]), config["suffix_strip_list"])
+    entry = core.build_entry_from_files(selected_obj, label, file_paths, config, warn_fn=_warn)
+    channel_files = {mid: ch["file"] for mid, ch in entry["channels"].items()}
     cmds.undoInfo(openChunk=True)
     try:
-        process_textures(file_paths, selected_obj, config=config)
+        entry["result"] = process_textures(
+            None, selected_obj, mat_basename=core.mesh_base_name(selected_obj, config["mesh_prefixes"]),
+            config=config, channel_files=channel_files, engine=engine)
+        entry["status"] = "applied"
+    except Exception as e:
+        entry["status"], entry["error"] = "error", str(e)
+        _warn(f"[TextureAutoloader] {selected_obj}: {e}")
     finally:
         cmds.undoInfo(closeChunk=True)
+
+    report = core.build_report([entry], language)
+    _log_print(report)
+    return report
 
 
 def process_textures(file_paths: Optional[List[str]], selected_obj: str,
                       mat_basename: Optional[str] = None,
                       config: Optional[Dict[str, Any]] = None,
-                      channel_files: Optional[Dict[str, str]] = None) -> int:
+                      channel_files: Optional[Dict[str, str]] = None,
+                      engine: Optional[str] = None) -> Dict[str, Any]:
     """
-    Crea un aiStandardSurface NUEVO, lo asigna al objeto y conecta las
-    texturas por tipo de mapa. Si el objeto ya tenía un material generado
-    por esta herramienta, lo limpia primero.
+    Crea un shader NUEVO del motor elegido (ver ENGINE_TEMPLATES; por
+    defecto el "render_engine" del config, Arnold), lo asigna al objeto y
+    conecta las texturas por tipo de mapa. Si el objeto ya tenía un
+    material generado por esta herramienta, lo limpia primero.
+
+    Devuelve un core.new_apply_result(): qué canal quedó cableado, cuál
+    se salteó y por qué, y cuál falló — de ahí sale el reporte ✔/✘.
     """
-    config = config or core.load_config(_app_dir(), warn_fn=_warn)
+    config = config or _load_config()
     map_types = config["map_types"]
+    engine = engine or config.get("render_engine", DEFAULT_ENGINE)
+    if engine not in ENGINE_TEMPLATES:
+        raise ValueError(f"unknown render engine '{engine}' "
+                         f"(available: {', '.join(ENGINE_TEMPLATES)})")
+    template = ENGINE_TEMPLATES[engine]
+    if not engine_plugin_loaded(engine):
+        raise RuntimeError(f"{template['label']} needs the '{template['plugin']}' plugin, "
+                           f"which is not loaded")
 
     _cleanup_existing_material(selected_obj)
 
-    name = f"M_{mat_basename}_MAT" if mat_basename else "M_Substance_Arnold_01"
-    mat_name = cmds.shadingNode('aiStandardSurface', asShader=True, name=name)
+    name = f"M_{mat_basename}_MAT" if mat_basename else "M_Substance_01_MAT"
+    mat_name = cmds.shadingNode(template["shader"], asShader=True, name=name)
+    _set_attrs(mat_name, template.get("shader_set", {}))
     sg_name = cmds.sets(renderable=True, noSurfaceShader=True, empty=True,
                          name=f"{mat_name}SG")
     cmds.connectAttr(f"{mat_name}.outColor", f"{sg_name}.surfaceShader", force=True)
 
     try:
         cmds.sets(selected_obj, forceElement=sg_name)
-    except Exception:
-        _warn(f"No se pudo asignar el material al objeto {selected_obj}.")
-        return len(file_paths or [])
+    except Exception as e:
+        raise RuntimeError(f"could not assign the material to {selected_obj}: {e}")
+
+    result = core.new_apply_result(material=mat_name)
 
     if channel_files is not None:
         resolved: Dict[str, Tuple[str, bool]] = {
@@ -425,7 +604,6 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
 
     created_nodes: Dict[str, str] = {}
     skipped_displacement = 0
-    unsupported: List[str] = []
     for mt in map_types:
         if mt["id"] not in resolved:
             continue
@@ -433,12 +611,16 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
 
         if mt["id"] == "displacement" and not config.get("enable_displacement_wiring", False):
             skipped_displacement += 1
+            result["skipped"]["displacement"] = {"reason": "displacement_off"}
             continue
 
-        if mt["id"] not in WIRED_MAP_TYPES:
-            # Un map type agregado a mano en el config: se avisa y NO se crea
-            # el nodo, en vez de dejar un file + place2dTexture sueltos.
-            unsupported.append(mt["id"])
+        if mt["id"] != "ao" and mt["id"] not in template["channels"]:
+            # Un map type agregado a mano en el config (algo que el README
+            # invita a hacer) para el que este motor no tiene regla: se
+            # reporta y NO se crea el nodo, en vez de dejar un file +
+            # place2dTexture sueltos en la escena.
+            result["skipped"][mt["id"]] = {"reason": "no_target",
+                                           "target": template["shader"]}
             continue
 
         try:
@@ -450,28 +632,42 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
                 except Exception:
                     pass
             apply_color_space(fn, mt["color_space"], is_raw=mt["raw"])
-            _wire_map_type(mt["id"], fn, mat_name, sg_name, created_nodes, stem)
+            if mt["id"] == "ao":
+                created_nodes["ao"] = fn  # se multiplica sobre baseColor más abajo
+                continue
+            skip = _wire_channel(engine, mt["id"], fn, mat_name, sg_name, stem)
+            if skip:
+                result["skipped"][mt["id"]] = skip
+                continue
+            if mt["id"] == "baseColor":
+                created_nodes["baseColor"] = fn
+            result["wired"][mt["id"]] = representative
         except Exception as e:
             _warn(f"Error procesando mapa '{mt['id']}': {e}")
+            result["failed"][mt["id"]] = str(e)
 
-    # Post-proceso: AO × BaseColor
-    if 'ao' in created_nodes:
+    # Post-proceso: AO × BaseColor (multiplyDivide: lo entienden los tres motores)
+    if "ao" in created_nodes:
+        target = template["channels"]["ao"]["multiply_into"]
+        base_attr = template["channels"][target]["attr"]
         try:
-            ao_node = created_nodes['ao']
+            ao_node = created_nodes["ao"]
             mult = cmds.shadingNode('multiplyDivide', asUtility=True,
                                      name="AO_BaseColor_Multiply")
-            if 'baseColor' in created_nodes:
-                bc = created_nodes['baseColor']
-                cmds.disconnectAttr(f"{bc}.outColor", f"{mat_name}.baseColor")
+            if "baseColor" in created_nodes:
+                bc = created_nodes["baseColor"]
+                cmds.disconnectAttr(f"{bc}.outColor", f"{mat_name}.{base_attr}")
                 cmds.connectAttr(f"{bc}.outColor", f"{mult}.input1", force=True)
             else:
                 cmds.setAttr(f"{mult}.input1X", 1.0)
                 cmds.setAttr(f"{mult}.input1Y", 1.0)
                 cmds.setAttr(f"{mult}.input1Z", 1.0)
             cmds.connectAttr(f"{ao_node}.outColor", f"{mult}.input2", force=True)
-            cmds.connectAttr(f"{mult}.output", f"{mat_name}.baseColor", force=True)
+            cmds.connectAttr(f"{mult}.output", f"{mat_name}.{base_attr}", force=True)
+            result["wired"]["ao"] = resolved["ao"][0]
         except Exception as e:
             _warn(f"Error configurando multiplicador de AO: {e}")
+            result["failed"]["ao"] = str(e)
 
     if skipped_displacement:
         _warn(
@@ -479,13 +675,6 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
             f"detected on {selected_obj.split('|')[-1]} but NOT wired (turn on "
             f"'enable_displacement_wiring' in texture_autoloader_config.json if you "
             f"want them — requires hand-tuning the displacementShader scale).")
-
-    if unsupported:
-        _warn(
-            f"[TextureAutoloader] map type(s) {', '.join(sorted(set(unsupported)))} come from "
-            f"texture_autoloader_config.json but this tool has no wiring rule for them, so "
-            f"they were NOT applied to {selected_obj.split('|')[-1]} (supported: "
-            f"{', '.join(sorted(WIRED_MAP_TYPES))}).")
 
     if unmatched:
         names = ", ".join(os.path.basename(f) for f in unmatched)
@@ -495,10 +684,10 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
 
     core.get_logger(_app_dir()).info(
         f"[TextureAutoloader] Material '{mat_name}' applied to {selected_obj.split('|')[-1]} "
-        f"with {len(created_nodes)} primary channel(s) wired "
-        f"({', '.join(sorted(created_nodes.keys())) or 'none'}).")
+        f"with {len(result['wired'])} channel(s) wired "
+        f"({', '.join(sorted(result['wired'])) or 'none'}).")
 
-    return len(unmatched)
+    return result
 
 
 # ── Auto-Loader: scan + match + apply ──────────────────────────
@@ -529,10 +718,11 @@ def match_objects_to_textures(objects: List[str], tex_map: Dict[str, List[str]],
 
 def apply_auto_textures(matches: List[Dict[str, Any]],
                          config: Dict[str, Any],
-                         progress_cb=None) -> Tuple[int, int]:
-    def _apply_one(obj: str, mat_basename: str, channel_files: Dict[str, str]) -> None:
-        process_textures(None, obj, mat_basename=mat_basename,
-                          config=config, channel_files=channel_files)
+                         progress_cb=None,
+                         engine: Optional[str] = None) -> Tuple[int, int]:
+    def _apply_one(obj: str, mat_basename: str, channel_files: Dict[str, str]) -> Dict[str, Any]:
+        return process_textures(None, obj, mat_basename=mat_basename,
+                                config=config, channel_files=channel_files, engine=engine)
 
     return core.apply_auto_textures(
         matches, config, apply_one_fn=_apply_one, progress_cb=progress_cb, log_fn=_log_print)
@@ -814,7 +1004,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         self.setMinimumWidth(600)
         self._apply_initial_size()
 
-        self.config: Dict[str, Any] = core.load_config(_app_dir(), warn_fn=_warn)
+        self.config: Dict[str, Any] = _load_config()
         self.state: Dict[str, Any] = core.load_state(_app_dir())
         self.folder: Optional[str] = None
         self.tex_map: Dict[str, List[str]] = {}
@@ -822,6 +1012,14 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         self.match_mode: str = "object_name"
         self.language: str = self.state.get(
             "language", self.config.get("language", core.DEFAULT_LANGUAGE))
+        self.naming_preset: str = core.apply_naming_preset(
+            self.config,
+            self.state.get("last_naming_preset",
+                           self.config.get("naming_preset", core.DEFAULT_PRESET_ID)),
+            warn_fn=_warn)["naming_preset"]
+        engine = self.state.get("last_render_engine",
+                                self.config.get("render_engine", DEFAULT_ENGINE))
+        self.render_engine: str = engine if engine in ENGINE_TEMPLATES else DEFAULT_ENGINE
 
         self._build_ui()
         self.setStyleSheet(_STYLESHEET)
@@ -880,6 +1078,11 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
     def _t(self, key: str, **kwargs) -> str:
         return core.tr(self.language, key, **kwargs)
 
+    def _cfg(self) -> Dict[str, Any]:
+        """Config efectivo: el de disco + el preset de nombres elegido
+        (y el threshold del slider, que vive en self.config)."""
+        return core.apply_naming_preset(self.config, self.naming_preset)
+
     def _on_toggle_language(self) -> None:
         self.language = core.other_language(self.language)
         self.state["language"] = self.language
@@ -896,6 +1099,13 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         self.lbl_header_subtitle.setText(self._t("app_subtitle"))
         self.btn_language.setText(core.tr(core.other_language(L), "lang_button"))
         self.btn_language.setToolTip(self._t("lang_button_tooltip"))
+
+        self.lbl_settings_tag.setText("◇  " + self._t("section_settings"))
+        self.lbl_render_engine.setText(self._t("render_engine_label"))
+        self.combo_render_engine.setToolTip(self._t("render_engine_tooltip"))
+        self.lbl_naming_preset.setText(self._t("naming_preset_label"))
+        self.combo_naming_preset.setToolTip(self._t("naming_preset_tooltip"))
+        self._refresh_naming_preset_combo()
 
         self.lbl_manual_tag.setText("◆  " + self._t("section_manual"))
         self.lbl_manual_desc.setText(self._t("section_manual_desc"))
@@ -940,6 +1150,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         c_layout.setContentsMargins(0, 0, 0, 0)
         c_layout.setSpacing(14)
 
+        c_layout.addWidget(self._build_settings_card())
         c_layout.addWidget(self._build_manual_card())
         c_layout.addWidget(self._build_autoloader_card(), 1)
         c_layout.addWidget(self._build_footer())
@@ -986,6 +1197,46 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         outer.addWidget(accent)
 
         return header
+
+    def _settings_row(self, lay: QtWidgets.QVBoxLayout, combo: QtWidgets.QComboBox
+                      ) -> QtWidgets.QLabel:
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        label = QtWidgets.QLabel()
+        label.setProperty("class", "MutedSmall")
+        label.setStyleSheet("letter-spacing:2px; font-weight:700;")
+        label.setFixedWidth(170)
+        combo.setEditable(False)
+        combo.setCursor(QtCore.Qt.PointingHandCursor)
+        row.addWidget(label)
+        row.addWidget(combo, 1)
+        lay.addLayout(row)
+        return label
+
+    def _build_settings_card(self) -> QtWidgets.QFrame:
+        """Opciones que afectan tanto al modo manual como al Auto-Loader."""
+        card = QtWidgets.QFrame()
+        card.setProperty("class", "Card")
+        lay = QtWidgets.QVBoxLayout(card)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(8)
+
+        self.lbl_settings_tag = QtWidgets.QLabel()
+        self.lbl_settings_tag.setProperty("class", "SectionTag")
+        lay.addWidget(self.lbl_settings_tag)
+
+        self.combo_render_engine = QtWidgets.QComboBox()
+        for engine_id, template in ENGINE_TEMPLATES.items():
+            self.combo_render_engine.addItem(template["label"], engine_id)
+        self.combo_render_engine.setCurrentIndex(
+            max(self.combo_render_engine.findData(self.render_engine), 0))
+        self.combo_render_engine.activated.connect(self._on_render_engine_activated)
+        self.lbl_render_engine = self._settings_row(lay, self.combo_render_engine)
+
+        self.combo_naming_preset = QtWidgets.QComboBox()
+        self.combo_naming_preset.activated.connect(self._on_naming_preset_activated)
+        self.lbl_naming_preset = self._settings_row(lay, self.combo_naming_preset)
+        return card
 
     def _build_manual_card(self) -> QtWidgets.QFrame:
         card = QtWidgets.QFrame()
@@ -1230,7 +1481,11 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
     # ── Handlers ─────────────────────────────────────────────
 
     def _on_manual_apply(self) -> None:
-        load_textures_and_apply(self.config)
+        if not self._ensure_engine_ready():
+            return
+        report = load_textures_and_apply(self._cfg(), self.language, engine=self.render_engine)
+        if report:
+            self._show_report_dialog(report)
 
     def _on_browse(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, self._t("select_folder_dialog"))
@@ -1257,6 +1512,54 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         self._persist_state()
         self._update_match_mode_info()
 
+    def _on_render_engine_activated(self, index: int) -> None:
+        engine = self.combo_render_engine.itemData(index)
+        if engine in ENGINE_TEMPLATES:
+            self.render_engine = engine
+            self.state["last_render_engine"] = engine
+            self._persist_state()
+
+    def _ensure_engine_ready(self) -> bool:
+        """Redshift / V-Ray necesitan su plugin cargado para crear el
+        shader: si no lo está, ofrece cargarlo antes de tocar la escena."""
+        if engine_plugin_loaded(self.render_engine):
+            return True
+        template = ENGINE_TEMPLATES[self.render_engine]
+        resp = QtWidgets.QMessageBox.question(
+            self, self._t("render_engine_title"),
+            self._t("msg_engine_plugin_not_loaded", engine=template["label"],
+                    plugin=template["plugin"]),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Yes)
+        if resp != QtWidgets.QMessageBox.Yes:
+            return False
+        try:
+            cmds.loadPlugin(template["plugin"])
+        except Exception as e:
+            _warn(self._t("msg_engine_plugin_load_failed", plugin=template["plugin"], error=e))
+            return False
+        return engine_plugin_loaded(self.render_engine)
+
+    def _refresh_naming_preset_combo(self) -> None:
+        self.combo_naming_preset.blockSignals(True)
+        self.combo_naming_preset.clear()
+        for preset_id, label in core.list_naming_presets(self.config, self.language):
+            self.combo_naming_preset.addItem(label, preset_id)
+        index = self.combo_naming_preset.findData(self.naming_preset)
+        self.combo_naming_preset.setCurrentIndex(max(index, 0))
+        self.combo_naming_preset.blockSignals(False)
+
+    def _on_naming_preset_activated(self, index: int) -> None:
+        preset_id = self.combo_naming_preset.itemData(index)
+        if not preset_id or preset_id == self.naming_preset:
+            return
+        self.naming_preset = preset_id
+        self.state["last_naming_preset"] = preset_id
+        self._persist_state()
+        # El agrupamiento en sets depende de los sufijos: re-escanear.
+        if self.folder:
+            self._set_folder(self.folder)
+
     def _update_match_mode_info(self) -> None:
         key = "match_mode_info_material_id" if self.match_mode == "material_id" \
             else "match_mode_info_object_name"
@@ -1272,7 +1575,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
 
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self.tex_map = scan_folder(folder, self.config, recursive)
+            self.tex_map = scan_folder(folder, self._cfg(), recursive)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
@@ -1317,7 +1620,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
             _warn(self._t("msg_load_folder_first"))
             return
 
-        self.matches = match_objects_to_textures(sel, self.tex_map, self.config,
+        self.matches = match_objects_to_textures(sel, self.tex_map, self._cfg(),
                                                   match_mode=self.match_mode)
         self._populate_tree()
         matched = sum(1 for m in self.matches if m["tex_base"])
@@ -1355,7 +1658,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
 
         new_base = None if choice == none_label else choice
         self.matches[match_idx] = core.build_match_entry(
-            m["obj"], new_base, 1.0 if new_base else 0.0, self.tex_map, self.config, warn_fn=_warn)
+            m["obj"], new_base, 1.0 if new_base else 0.0, self.tex_map, self._cfg(), warn_fn=_warn)
         self._populate_tree()
 
     def _on_edit_channel(self, match_idx: int, map_id: str) -> None:
@@ -1391,6 +1694,8 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         if not self.matches:
             _warn(self._t("msg_run_smart_match_first"))
             return
+        if not self._ensure_engine_ready():
+            return
 
         conflicts = [m["obj"] for m in self.matches
                      if m["tex_base"] and has_autoloader_material(m["obj"])]
@@ -1419,22 +1724,35 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
 
         cmds.undoInfo(openChunk=True)
         try:
-            applied, skipped = apply_auto_textures(self.matches, self.config, progress_cb=_cb)
+            applied, skipped = apply_auto_textures(self.matches, self._cfg(), progress_cb=_cb,
+                                                   engine=self.render_engine)
         finally:
             cmds.undoInfo(closeChunk=True)
             progress.setValue(len(self.matches))
 
+        report = core.build_report(self.matches, self.language, tex_map=self.tex_map)
+        _log_print(report)
+        self._show_report_dialog(report, applied, skipped)
+
+    def _show_report_dialog(self, report: str, applied: Optional[int] = None,
+                            skipped: Optional[int] = None) -> None:
+        """Resumen arriba; el reporte ✔/✘ completo en "Show Details…"
+        (el área desplegable estándar de QMessageBox)."""
+        rows = [f"<p style='font-size:13px;'><b>{self._t('done_title')}</b></p>"]
+        if applied is not None:
+            rows.append(f"<p>{self._t('done_body_applied')}: "
+                        f"<span style='color:#2ED573;'>{applied}</span></p>")
+            rows.append(f"<p>{self._t('done_body_skipped')}: "
+                        f"<span style='color:#FFB547;'>{skipped}</span></p>")
+        rows.append(f"<p>{html.escape(report.splitlines()[-1])}</p>")
+        rows.append(f"<p style='color:#9297A8;'>{self._t('done_body_report_hint')}</p>")
+
         msg = QtWidgets.QMessageBox(self)
         msg.setWindowTitle(self._t("done_title"))
-        msg.setText(
-            f"<div style='font-family:Segoe UI; color:#E8E8EA;'>"
-            f"<p style='font-size:13px;'><b>{self._t('done_title')}</b></p>"
-            f"<p>{self._t('done_body_applied')}: <span style='color:#2ED573;'>{applied}</span></p>"
-            f"<p>{self._t('done_body_skipped')}: <span style='color:#FFB547;'>{skipped}</span></p>"
-            f"</div>"
-        )
+        msg.setText("<div style='font-family:Segoe UI; color:#E8E8EA;'>" + "".join(rows) + "</div>")
+        msg.setDetailedText(report)
         msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
-        msg.exec_()
+        (msg.exec if hasattr(msg, "exec") else msg.exec_)()
 
 
 def create_ui() -> TextureAutoloaderDialog:
