@@ -14,6 +14,15 @@ pytest advanced/tests -v        # the shared core
 pytest advanced/maya/tests -v   # the Maya wrapper and the wiring, on the stub
 ```
 
+None of the DCC interpreters ship pytest, and those are the ones worth
+checking — mayapy is the Python the tool actually runs on, and Maya 2022's is
+3.7. `run_unit_tests.py` runs the same suites with no dependencies at all:
+
+```bash
+"C:/Program Files/Autodesk/Maya2022/bin/mayapy.exe" tests/run_unit_tests.py
+"C:/Program Files/Blender Foundation/Blender 5.2/5.2/python/bin/python.exe" tests/run_unit_tests.py
+```
+
 ## Integration tests (this folder)
 
 The unit suites cannot tell whether the shading network really gets built: a
