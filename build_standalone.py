@@ -80,8 +80,15 @@ overrides are prefixed with _core_ so both can coexist in one namespace.
 
 
 def read(path):
+    """Source text with LF line endings, whatever is on disk.
+
+    git checks these files out with CRLF on Windows (core.autocrlf), while the
+    generator's own string literals are LF, so without normalizing here the
+    output came out with mixed endings and --check reported a freshly
+    generated file as out of date.
+    """
     with open(path, encoding="utf-8", newline="") as f:
-        return f.read()
+        return f.read().replace("\r\n", "\n")
 
 
 def top_level_names(tree):
@@ -269,7 +276,7 @@ def main():
                 stale.append(spec["output"])
             print("  %-52s %s" % (os.path.relpath(spec["output"], REPO), status))
         else:
-            with open(spec["output"], "w", encoding="utf-8", newline="") as f:
+            with open(spec["output"], "w", encoding="utf-8", newline="\n") as f:
                 f.write(generated)
             print("  %-52s %d lines%s"
                   % (os.path.relpath(spec["output"], REPO), generated.count("\n"),
