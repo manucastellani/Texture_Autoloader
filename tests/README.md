@@ -56,7 +56,9 @@ the script, so read its result from the file named by `TAL_UNREAL_RESULT`
 (default `%TEMP%/tal_unreal_result.txt`). On Unreal 5.7 add
 `-ini:Engine:[ConsoleVariables]:Interchange.FeatureFlags.Import.PNG=0` — 5.7's
 Interchange importer asserts when there is no Slate UI, which only happens in
-commandlet mode.
+commandlet mode. Give each engine version **its own** throwaway project:
+assets saved by 5.8 can't be opened by 5.7, and the leftovers make the next
+run fail in its own setup rather than in the tool.
 
 Also worth running, and the reason the single-file builds can be trusted:
 
