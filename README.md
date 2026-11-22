@@ -34,6 +34,32 @@ click Apply."
 4. **Apply**: creates a new shader per object and wires baseColor,
    roughness, metallic, normal, emission, ambient occlusion (multiplied
    into base color), opacity, and — opt-in only — displacement.
+5. **Report** what happened, per file: `✔` wired, `✘` no match / no input
+   for that channel / error, `–` deliberately skipped (channel turned
+   off, displacement opt-in, a duplicate of a map already used), plus the
+   texture sets no object claimed.
+
+```
+SM_Rock  →  Rock  (95%)  ·  M_Rock_MAT
+    ✔ Rock_BaseColor.png → baseColor
+    – Rock_Height.png → displacement: not wired, displacement is opt-in
+    ✘ no match: Rock_Curvature.png
+```
+
+**Render engine (Maya)**: Arnold, Redshift or V-Ray, picked in the UI.
+What changes per engine is only which shader to create and which input
+each channel goes to — one template per engine, not a different tool.
+Every attribute is checked before connecting, so a name that doesn't
+exist in your renderer version shows up as `✘` in the report instead of
+breaking the batch. Blender needs no selector: the Principled BSDF
+covers both Cycles and EEVEE.
+
+**Naming presets**: studios customize Substance's export suffixes
+(`_BaseColor` vs `_Albedo` vs `_BC`). Instead of editing `map_types` by
+hand, name your convention once in the config and pick it in the UI.
+Preset suffixes are matched at the *end* of the file name, so short ones
+are safe: `Rock_R.png` is roughness, while `Car_Rim_BC.png` is base
+color and not roughness because it contains `_R`.
 
 ## Why displacement is opt-in, and why UDIM detection has a denylist
 
@@ -72,10 +98,16 @@ TextureAutoloader/
 │   ├── blender/
 │   │   └── texture_autoloader_blender.py
 │   └── tests/
-├── tests/                          # integration tests that run inside a real Maya / Blender
+├── unreal/                         # Unreal Engine port — see unreal/README.md
+├── tests/                          # integration tests that run inside a real Maya / Blender / Unreal
+├── build_standalone.py             # generates the two single-file builds from advanced/
 ├── LICENSE
 └── .gitignore
 ```
+
+The two single-file builds are **generated** from `advanced/` by
+`build_standalone.py` — they used to be hand-made copies, and they
+drifted. Fix things in `advanced/`, run the script, commit both.
 
 If you just want to use the tool, everything you need is the single
 file in `maya/` or `blender/` above — nothing else in this repo matters
@@ -212,8 +244,14 @@ feels still means opening it.
   real-world mileage — please report anything that looks off, especially
   around UDIM handling and node socket names (Blender has renamed a few
   Principled BSDF sockets across versions).
+- Redshift and V-Ray are written from each renderer's documented node and
+  attribute names and checked against a stub, but have not run in a real
+  Maya with those renderers installed. Arnold is verified in a real Maya.
+- The Unreal port reports and skips UDIM sets (Unreal imports those as
+  virtual textures, which needs a virtual-texture sampler in the master
+  material), and doesn't bind displacement or split packed maps.
 - No thumbnail previews, and no "save this channel setup as a preset per
-  character" yet — both noted as reasonable next steps.
+  character" yet.
 
 ## License
 

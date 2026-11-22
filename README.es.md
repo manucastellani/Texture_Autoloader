@@ -36,6 +36,33 @@ una carpeta, revisar los matches, click en Aplicar".
 4. **Aplica**: crea un shader nuevo por objeto y cablea baseColor,
    roughness, metallic, normal, emission, ambient occlusion (multiplicado
    sobre base color), opacity y — sólo si lo activás — displacement.
+5. **Reporta** qué pasó con cada archivo: `✔` cableado, `✘` sin match /
+   sin input para ese canal / error, `–` omitido a propósito (canal
+   desactivado, displacement opcional, un duplicado de un mapa ya usado),
+   más los sets de texturas que ningún objeto usó.
+
+```
+SM_Rock  →  Rock  (95%)  ·  M_Rock_MAT
+    ✔ Rock_BaseColor.png → baseColor
+    – Rock_Height.png → displacement: no se cablea, el displacement es opcional
+    ✘ sin match: Rock_Curvature.png
+```
+
+**Motor de render (Maya)**: Arnold, Redshift o V-Ray, elegido desde la
+UI. Lo único que cambia por motor es qué shader crear y a qué input va
+cada canal — una plantilla por motor, no una herramienta distinta. Cada
+atributo se verifica antes de conectar, así que un nombre que no exista
+en tu versión del renderer sale como `✘` en el reporte en vez de romper
+la corrida. Blender no necesita selector: el Principled BSDF sirve para
+Cycles y EEVEE.
+
+**Presets de naming**: cada estudio customiza los sufijos de export de
+Substance (`_BaseColor` vs `_Albedo` vs `_BC`). En vez de editar
+`map_types` a mano, nombrás tu convención una vez en el config y la
+elegís desde la UI. Los sufijos del preset se buscan al *final* del
+nombre, así que los cortos son seguros: `Rock_R.png` es roughness,
+mientras que `Car_Rim_BC.png` es base color y no roughness por contener
+`_R`.
 
 ## Por qué displacement es opt-in, y por qué la detección de UDIM tiene una lista negra
 
@@ -76,10 +103,17 @@ TextureAutoloader/
 │   ├── blender/
 │   │   └── texture_autoloader_blender.py
 │   └── tests/
-├── tests/                          # tests de integración, corren dentro de Maya / Blender reales
+├── unreal/                         # port a Unreal Engine — ver unreal/README.md
+├── tests/                          # tests de integración, dentro de Maya / Blender / Unreal reales
+├── build_standalone.py             # genera los dos archivos de un solo archivo desde advanced/
 ├── LICENSE
 └── .gitignore
 ```
+
+Los dos builds de un solo archivo se **generan** desde `advanced/` con
+`build_standalone.py` — antes eran copias hechas a mano, y divergieron.
+Los cambios van en `advanced/`, después se corre el script y se
+commitean los dos.
 
 Si solo querés usar la herramienta, todo lo que necesitás es el único
 archivo en `maya/` o `blender/` de arriba — nada más en este repo te
@@ -221,9 +255,15 @@ juzgar cómo se siente la herramienta sigue haciendo falta abrirla.
   uso real acumulado — reportá cualquier cosa rara que veas, en especial
   con UDIM y con nombres de sockets de nodos (Blender renombró algunos
   sockets del Principled BSDF entre versiones).
+- Redshift y V-Ray están escritos con los nombres de nodos y atributos
+  que documenta cada renderer y verificados contra un stub, pero no
+  corrieron en un Maya con esos renderers instalados. Arnold sí está
+  verificado en un Maya real.
+- El port a Unreal reporta y saltea los sets UDIM (Unreal los importa
+  como virtual textures, que necesitan un sampler propio en el master
+  material), y no cablea displacement ni separa mapas empaquetados.
 - Todavía no hay miniaturas de textura ni "guardar esta configuración de
-  canales como preset por personaje" — ambas anotadas como próximos
-  pasos razonables.
+  canales como preset por personaje".
 
 ## Licencia
 
