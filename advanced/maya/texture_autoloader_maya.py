@@ -304,6 +304,16 @@ def _cleanup_existing_material(obj: str) -> int:
         return 0
 
 
+# Tipos de mapa que esta función sabe cablear. Un `map_types` extendido a mano
+# en el config (algo que el README invita a hacer) puede traer ids que acá no
+# existen: antes se creaba el nodo de textura igual y quedaba suelto en la
+# escena, sin conexión y sin aviso. Ver process_textures.
+WIRED_MAP_TYPES = frozenset({
+    "baseColor", "roughness", "metallic", "normal", "emission", "ao",
+    "displacement", "opacity",
+})
+
+
 def _wire_map_type(map_id: str, fn: str, mat_name: str, sg_name: str,
                     created_nodes: Dict[str, str], stem: str) -> None:
     """Cablea un nodo de textura ya creado según el tipo de mapa detectado."""
@@ -338,6 +348,10 @@ def _wire_map_type(map_id: str, fn: str, mat_name: str, sg_name: str,
     elif map_id == "displacement":
         disp_node = cmds.shadingNode('displacementShader', asShader=True,
                                       name=f"{stem}_dispShader")
+        # alphaIsLuminance, igual que en roughness/metallic: un height export
+        # no trae canal alfa, así que sin esto outAlpha es 1.0 constante y el
+        # objeto se infla uniforme en vez de seguir el mapa.
+        cmds.setAttr(f"{fn}.alphaIsLuminance", True)
         try:
             cmds.connectAttr(f"{fn}.outAlpha", f"{disp_node}.displacement", force=True)
         except Exception:
@@ -411,6 +425,7 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
 
     created_nodes: Dict[str, str] = {}
     skipped_displacement = 0
+    unsupported: List[str] = []
     for mt in map_types:
         if mt["id"] not in resolved:
             continue
@@ -418,6 +433,12 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
 
         if mt["id"] == "displacement" and not config.get("enable_displacement_wiring", False):
             skipped_displacement += 1
+            continue
+
+        if mt["id"] not in WIRED_MAP_TYPES:
+            # Un map type agregado a mano en el config: se avisa y NO se crea
+            # el nodo, en vez de dejar un file + place2dTexture sueltos.
+            unsupported.append(mt["id"])
             continue
 
         try:
@@ -458,6 +479,13 @@ def process_textures(file_paths: Optional[List[str]], selected_obj: str,
             f"detected on {selected_obj.split('|')[-1]} but NOT wired (turn on "
             f"'enable_displacement_wiring' in texture_autoloader_config.json if you "
             f"want them — requires hand-tuning the displacementShader scale).")
+
+    if unsupported:
+        _warn(
+            f"[TextureAutoloader] map type(s) {', '.join(sorted(set(unsupported)))} come from "
+            f"texture_autoloader_config.json but this tool has no wiring rule for them, so "
+            f"they were NOT applied to {selected_obj.split('|')[-1]} (supported: "
+            f"{', '.join(sorted(WIRED_MAP_TYPES))}).")
 
     if unmatched:
         names = ", ".join(os.path.basename(f) for f in unmatched)
@@ -784,8 +812,7 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setMinimumWidth(600)
-        self.setMinimumHeight(1100)
-        self.resize(640, 1220)
+        self._apply_initial_size()
 
         self.config: Dict[str, Any] = core.load_config(_app_dir(), warn_fn=_warn)
         self.state: Dict[str, Any] = core.load_state(_app_dir())
@@ -816,6 +843,37 @@ class TextureAutoloaderDialog(QtWidgets.QDialog):
             self.btn_match_object.setChecked(True)
 
         self._retranslate_ui()
+
+    # ── Tamaño de la ventana ──────────────────────────────────
+
+    #  Alto "cómodo" (todo visible sin scrollear) y mínimo real. El mínimo
+    #  tiene que entrar en una pantalla de 1080p con barra de tareas: antes
+    #  era 1100 px y la ventana abría en 1220, así que en un monitor de 1080
+    #  (o en un portátil) no se podía encoger y el botón de aplicar quedaba
+    #  abajo, fuera de la pantalla. El contenido ya vive en un QScrollArea,
+    #  así que achicar sólo agrega scroll, no esconde nada.
+    PREFERRED_HEIGHT = 1220
+    MINIMUM_HEIGHT = 560
+
+    def _available_height(self) -> int:
+        """Alto usable de la pantalla donde está la ventana (sin la barra de
+        tareas). Si Qt no lo puede decir, asume 1080p."""
+        try:
+            screen = self.screen() if hasattr(self, "screen") else None
+            if screen is None:
+                app = QtWidgets.QApplication.instance()
+                screen = app.primaryScreen() if app else None
+            if screen is not None:
+                return screen.availableGeometry().height()
+        except Exception:
+            pass
+        return 1032
+
+    def _apply_initial_size(self) -> None:
+        available = self._available_height()
+        self.setMinimumHeight(min(self.MINIMUM_HEIGHT, available))
+        self.resize(640, max(min(self.PREFERRED_HEIGHT, available - 48),
+                             min(self.MINIMUM_HEIGHT, available)))
 
     # ── i18n ──────────────────────────────────────────────────
 
