@@ -365,8 +365,11 @@ def get_logger(app_dir: str) -> "logging.Logger":
 
     try:
         log_path = os.path.join(app_dir, LOG_FILENAME)
+        # delay=True: the file is created on the first message instead of on
+        # handler creation, so an app_dir that never logs anything isn't left
+        # with an empty texture_autoloader.log.
         handler = logging.handlers.RotatingFileHandler(
-            log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+            log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8", delay=True)
         handler.setLevel(logging.DEBUG)
         handler.setFormatter(logging.Formatter(
             "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
@@ -415,8 +418,12 @@ _FUZZ, HAS_RAPIDFUZZ = ensure_rapidfuzz()
 
 _EXTS = set(DEFAULT_CONFIG["texture_extensions"])
 
+# The separator includes the dot because Substance and Mari export UDIM tiles
+# as "Wall_BaseColor.1001.png": without it, every tile was grouped as its own
+# texture set and the UDIM never collapsed (which also left Maya renaming the
+# file nodes, since a dot is not valid in a node name).
 _TRAILING_MOD = re.compile(
-    r'[_\-](opengl|directx|dx|gl|tangent|world|object|space|'
+    r'[._\-](opengl|directx|dx|gl|tangent|world|object|space|'
     r'1k|2k|4k|8k|hi|lo|hd|sd|udim|\d{4})$', re.I)
 
 # Bounded to real UDIM tile numbers (1001-1999 = up to 10x10 tiles,
@@ -466,7 +473,10 @@ def mesh_base_name(obj: str, mesh_prefixes: List[str]) -> str:
     return n
 
 
-_MATERIAL_SUFFIX_RE = re.compile(r'[_]?(mat|material|shader|sg)$', re.I)
+# "txa" is this tool's own Blender material suffix (M_<name>_TXA): without it,
+# re-running Smart Match in Material ID mode compared "Rock_TXA" instead of
+# "Rock" against the texture sets.
+_MATERIAL_SUFFIX_RE = re.compile(r'[_]?(mat|material|shader|sg|txa)$', re.I)
 
 
 def material_base_name(material: str, mesh_prefixes: List[str]) -> str:
@@ -487,16 +497,64 @@ def material_base_name(material: str, mesh_prefixes: List[str]) -> str:
     return n.strip('-_')
 
 
-def similarity(a: str, b: str) -> float:
-    """0..1 similarity between two names, tolerant of typos and substrings."""
-    a = a.lower().replace("_", "").replace("-", "").replace(" ", "")
-    b = b.lower().replace("_", "").replace("-", "").replace(" ", "")
+_WORD_SEP_RE = re.compile(r'[._\-\s]+')
+
+# Scores for the two kinds of evidence below. Full-word containment is strong
+# evidence (an artist's naming convention), a bare substring is weak.
+_WORD_MATCH_SCORE = 0.90
+_SUBSTRING_FLOOR = 0.60
+_SUBSTRING_RANGE = 0.30
+
+
+def _flat_name(name: str) -> str:
+    return _WORD_SEP_RE.sub('', name).lower()
+
+
+def _name_words(name: str) -> set:
+    return {w for w in _WORD_SEP_RE.split(name.lower()) if w}
+
+
+def _fuzzy_ratio(a: str, b: str) -> float:
     if HAS_RAPIDFUZZ:
-        score = _FUZZ.WRatio(a, b) / 100.0
-    else:
-        score = difflib.SequenceMatcher(None, a, b).ratio()
-    if a in b or b in a:
-        score = max(score, 0.85)
+        return _FUZZ.WRatio(a, b) / 100.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def similarity(a: str, b: str) -> float:
+    """
+    0..1 similarity between two names, tolerant of typos.
+
+    The number is meant to be read as confidence in the UI, so the three kinds
+    of evidence are kept apart instead of collapsing into one flat bonus:
+
+      - same name ignoring separators and case -> 1.0
+      - every WORD of one name is a word of the other ("Cabeza" vs
+        "Modelado2_Cabeza", "Hero" vs "SK_Hero_Body") -> at least 0.90, since
+        that is how artists actually name texture sets
+      - one name merely CONTAINS the other ("Boca" inside
+        "Modelado2_TornilloBoca") -> trusted only in proportion to how much of
+        the longer name it covers, never above 0.90
+
+    The old version gave a flat 0.85 to anything in a substring relationship
+    (and rapidfuzz's partial ratio inflates those pairs to 0.90 on its own), so
+    a wrong match looked as confident as a right one, two candidates tied, and
+    the sensitivity slider had no effect between those values. Everything that
+    is neither of the above still falls back to the fuzzy ratio, which is what
+    catches typos ("brazos" vs "Braxos").
+    """
+    flat_a, flat_b = _flat_name(a), _flat_name(b)
+    if not flat_a or not flat_b:
+        return 0.0
+    if flat_a == flat_b:
+        return 1.0
+
+    score = _fuzzy_ratio(flat_a, flat_b)
+    words_a, words_b = _name_words(a), _name_words(b)
+    if words_a and words_b and (words_a <= words_b or words_b <= words_a):
+        return max(score, _WORD_MATCH_SCORE)
+    if flat_a in flat_b or flat_b in flat_a:
+        short, long = sorted((flat_a, flat_b), key=len)
+        return min(score, _SUBSTRING_FLOOR + _SUBSTRING_RANGE * (len(short) / len(long)))
     return score
 
 
@@ -518,14 +576,21 @@ def scan_texture_folder(folder: str, suffix_strip_list: List[str],
 
 def compute_matches(obj_names: List[str], tex_bases: List[str],
                      threshold: float) -> List[Tuple[str, Optional[str], float]]:
-    """Pairs each logical object name with the best tex_base by similarity."""
+    """
+    Pairs each logical object name with the best tex_base by similarity.
+
+    Ties are broken deterministically: fewer extra words first (so "Cabeza"
+    prefers "Modelado2_Cabeza" over "Modelado2_CabezaExtra"), then shorter
+    name, then alphabetical. Picking the first candidate instead meant the
+    winner depended on the order the folder happened to list the files in.
+    """
     results = []
     for obj_base in obj_names:
-        best_base, best_score = None, 0.0
-        for tb in tex_bases:
-            s = similarity(obj_base, tb)
-            if s > best_score:
-                best_score, best_base = s, tb
+        ranked = sorted(
+            ((similarity(obj_base, tb), len(_name_words(tb)), len(tb), tb.lower(), tb)
+             for tb in tex_bases),
+            key=lambda c: (-c[0], c[1], c[2], c[3]))
+        best_score, best_base = (ranked[0][0], ranked[0][4]) if ranked else (0.0, None)
         results.append((obj_base, best_base if best_score >= threshold else None, best_score))
     return results
 

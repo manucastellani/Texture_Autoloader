@@ -47,7 +47,6 @@ bl_info = {
 import os
 import re
 import sys
-import glob
 from typing import Optional, List, Dict, Tuple, Any
 
 import bpy
@@ -177,14 +176,18 @@ def _udim_tiles_from_disk(representative_path: str) -> Dict[int, str]:
     """Dado un path con el token "<UDIM>", busca en disco los archivos
     reales de cada tile y devuelve {numero_de_tile: filepath}. Blender
     necesita registrar cada tile a mano (a diferencia de Arnold, que
-    resuelve el token <UDIM> por convención en el momento del render)."""
-    pattern = representative_path.replace("<UDIM>", "[0-9][0-9][0-9][0-9]")
-    tiles: Dict[int, str] = {}
-    for fp in glob.glob(pattern):
-        m = re.search(r'(\d{4})', os.path.basename(fp))
-        if m:
-            tiles[int(m.group(1))] = fp
-    return tiles
+    resuelve el token <UDIM> por convención en el momento del render).
+
+    El número se lee en la posición del token (ver core.get_udim_tile_files),
+    no como "el primer grupo de 4 dígitos del nombre": con eso, un asset como
+    "Crate2048_BaseColor.1001.png" se registraba como tile 2048."""
+    folder = os.path.dirname(representative_path)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return {}
+    return core.get_udim_tile_files(
+        representative_path, [os.path.join(folder, n) for n in names])
 
 
 def _load_image(file_path: str, is_udim: bool, colorspace: str) -> Optional["bpy.types.Image"]:
@@ -217,6 +220,37 @@ def _load_image(file_path: str, is_udim: bool, colorspace: str) -> Optional["bpy
     except RuntimeError as e:
         _warn(f"[TextureAutoloader] Could not load image '{file_path}': {e}")
         return None
+
+
+# El config comparte los nombres de color space con la versión de Maya, que
+# usa la nomenclatura de Arnold ("Raw"); Blender llama "Non-Color" a lo mismo.
+# Con esta tabla el valor del config se respeta en los dos DCC — antes Blender
+# tenía los nombres hardcodeados y la clave del config no hacía nada. Un valor
+# que no esté acá (un OCIO propio del estudio) se pasa tal cual, y si Blender
+# no lo reconoce, _load_image avisa y deja el default.
+_COLORSPACE_ALIASES = {
+    "raw": "Non-Color",
+    "non-color": "Non-Color",
+    "noncolor": "Non-Color",
+    "srgb": "sRGB",
+}
+
+# Tipos de mapa que esta versión sabe cablear: un `map_types` extendido a mano
+# en el config puede traer ids que acá no existen (ver process_textures).
+WIRED_MAP_TYPES = frozenset({
+    "baseColor", "roughness", "metallic", "normal", "emission", "ao",
+    "displacement", "opacity",
+})
+
+
+def _colorspace_for(map_id: str, config: Dict[str, Any], default: str) -> str:
+    """Color space del config para ese canal, traducido a como lo llama
+    Blender."""
+    for mt in config.get("map_types", []):
+        if mt.get("id") == map_id and mt.get("color_space"):
+            value = str(mt["color_space"]).strip()
+            return _COLORSPACE_ALIASES.get(value.lower(), value)
+    return default
 
 
 def _add_image_node(node_tree: "bpy.types.NodeTree", file_path: str, is_udim: bool,
@@ -285,6 +319,7 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
     ao_node = None
     y = 400
     skipped_displacement = 0
+    unsupported: List[str] = []
 
     for map_id, file_path in channel_files.items():
         is_udim = "<UDIM>" in file_path
@@ -294,7 +329,9 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
             continue
 
         if map_id == "baseColor":
-            node = _add_image_node(node_tree, file_path, is_udim, "sRGB", "Base Color", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "sRGB"), "Base Color", -400, y)
             if node:
                 base_color_node = node
                 socket = _socket(bsdf, "Base Color")
@@ -302,21 +339,27 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                     node_tree.links.new(node.outputs["Color"], socket)
 
         elif map_id == "roughness":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Roughness", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Roughness", -400, y)
             if node:
                 socket = _socket(bsdf, "Roughness")
                 if socket:
                     node_tree.links.new(node.outputs["Color"], socket)
 
         elif map_id == "metallic":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Metallic", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Metallic", -400, y)
             if node:
                 socket = _socket(bsdf, "Metallic")
                 if socket:
                     node_tree.links.new(node.outputs["Color"], socket)
 
         elif map_id == "normal":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Normal", -600, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Normal", -600, y)
             if node:
                 normal_map = node_tree.nodes.new("ShaderNodeNormalMap")
                 normal_map.location = (-350, y)
@@ -326,7 +369,9 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                     node_tree.links.new(normal_map.outputs["Normal"], socket)
 
         elif map_id == "emission":
-            node = _add_image_node(node_tree, file_path, is_udim, "sRGB", "Emission", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "sRGB"), "Emission", -400, y)
             if node:
                 color_socket = _socket(bsdf, "Emission Color", "Emission")
                 if color_socket:
@@ -336,10 +381,14 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                     strength_socket.default_value = 1.0
 
         elif map_id == "ao":
-            ao_node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "AO", -400, y)
+            ao_node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "AO", -400, y)
 
         elif map_id == "opacity":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Opacity", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Opacity", -400, y)
             if node:
                 socket = _socket(bsdf, "Alpha")
                 if socket:
@@ -353,7 +402,9 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                     pass
 
         elif map_id == "displacement":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Displacement", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Displacement", -400, y)
             if node:
                 disp_node = node_tree.nodes.new("ShaderNodeDisplacement")
                 disp_node.location = (150, -300)
@@ -364,6 +415,12 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                 # but doesn't configure that for you, same conservative
                 # stance as the Maya version's "detected but not
                 # automatically deformed" behavior.
+
+        else:
+            # Un map type agregado a mano en el config (algo que el README
+            # invita a hacer): no hay regla para cablearlo, así que se avisa
+            # en vez de ignorarlo en silencio.
+            unsupported.append(map_id)
 
         y -= 260
 
@@ -382,6 +439,13 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
         base_socket = _socket(bsdf, "Base Color")
         if base_socket:
             node_tree.links.new(mix_node.outputs["Result"], base_socket)
+
+    if unsupported:
+        _warn(
+            f"[TextureAutoloader] map type(s) {', '.join(sorted(set(unsupported)))} come from "
+            f"texture_autoloader_config.json but this addon has no wiring rule for them, so "
+            f"they were NOT applied to {obj.name} (supported: "
+            f"{', '.join(sorted(WIRED_MAP_TYPES))}).")
 
     if skipped_displacement:
         _warn(

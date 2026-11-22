@@ -72,6 +72,7 @@ TextureAutoloader/
 │   ├── blender/
 │   │   └── texture_autoloader_blender.py
 │   └── tests/
+├── tests/                          # integration tests that run inside a real Maya / Blender
 ├── LICENSE
 └── .gitignore
 ```
@@ -176,21 +177,30 @@ studio config.
 
 ## Testing
 
-Only the modular build in `advanced/` has an automated test suite (the
-standalone files are hand-copied from it and aren't independently
-tested):
+Unit tests cover the matching logic with no Maya and no Blender involved
+(`maya.cmds` is replaced by a stub):
 
 ```bash
 pip install pytest
 pytest advanced/tests -v        # core logic, no Maya/Blender/Qt needed
-pytest advanced/maya/tests -v   # Maya wrapper, needs no real Maya install (stubs included)
+pytest advanced/maya/tests -v   # Maya wrapper and wiring, on the stub
 ```
 
-There's currently no automated test suite for the Blender addon or for
-either UI layer (Qt dialog, Blender panel) — see `advanced/tests/TESTING.md`
-and `advanced/maya/tests/TESTING.md` for exactly what is and isn't
-covered, and why. Manual testing inside the actual DCC is still the way
-to validate the UI and the real shader output.
+A stub accepts any connection, though, so it cannot tell whether the
+shading network really gets built. That's what `tests/` is for: those
+scripts run inside a real Maya and a real Blender, headless, and inspect
+the result — and they cover the single-file builds above, not just the
+modular one. See [tests/README.md](tests/README.md):
+
+```bash
+"C:/Program Files/Autodesk/Maya2027/bin/mayapy.exe" tests/integration_maya.py
+blender -b --factory-startup --python-exit-code 1 --python tests/integration_blender.py
+```
+
+See `advanced/tests/TESTING.md` and `advanced/maya/tests/TESTING.md` for
+what the unit suites do and don't cover, and why. Neither layer drives
+the UI itself beyond building the Qt dialog, so judging how the tool
+feels still means opening it.
 
 ## Known limitations
 

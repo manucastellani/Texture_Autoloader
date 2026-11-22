@@ -76,6 +76,7 @@ TextureAutoloader/
 │   ├── blender/
 │   │   └── texture_autoloader_blender.py
 │   └── tests/
+├── tests/                          # tests de integración, corren dentro de Maya / Blender reales
 ├── LICENSE
 └── .gitignore
 ```
@@ -185,21 +186,30 @@ compartido del estudio.
 
 ## Tests
 
-Sólo la versión modular en `advanced/` tiene suite de tests automatizada
-(los archivos standalone son copias hechas a mano y no se testean por
-separado):
+Los tests unitarios cubren la lógica de matching sin Maya ni Blender
+(`maya.cmds` se reemplaza por un stub):
 
 ```bash
 pip install pytest
 pytest advanced/tests -v        # lógica del core, sin necesitar Maya/Blender/Qt
-pytest advanced/maya/tests -v   # wrapper de Maya, no necesita Maya real instalado (trae stubs)
+pytest advanced/maya/tests -v   # wrapper de Maya y cableado, sobre el stub
 ```
 
-Por ahora no hay suite automatizada para el addon de Blender ni para
-ninguna de las dos UIs (el diálogo de Qt, el panel de Blender) — ver
-`advanced/tests/TESTING.md` y `advanced/maya/tests/TESTING.md` para el
-detalle exacto de qué cubre cada una y por qué. Probar la UI y el
-resultado real del shader todavía requiere el DCC de verdad.
+Pero un stub acepta cualquier conexión, así que no puede decir si el
+grafo de shading realmente se armó. Para eso está `tests/`: esos scripts
+corren adentro de un Maya y un Blender reales, sin interfaz, y revisan el
+resultado — y cubren también los builds de un solo archivo, no sólo el
+modular. Ver [tests/README.md](tests/README.md):
+
+```bash
+"C:/Program Files/Autodesk/Maya2027/bin/mayapy.exe" tests/integration_maya.py
+blender -b --factory-startup --python-exit-code 1 --python tests/integration_blender.py
+```
+
+En `advanced/tests/TESTING.md` y `advanced/maya/tests/TESTING.md` está el
+detalle de qué cubre cada suite unitaria y por qué. Ninguna de las dos
+capas maneja la UI más allá de construir el diálogo de Qt, así que para
+juzgar cómo se siente la herramienta sigue haciendo falta abrirla.
 
 ## Limitaciones conocidas
 

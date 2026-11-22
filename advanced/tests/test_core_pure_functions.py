@@ -69,6 +69,76 @@ def test_get_udim_tile_files_extracts_tile_numbers(core_module):
     }
 
 
+def test_tex_base_name_strips_udim_tile_with_dot_separator(core_module):
+    """Substance and Mari export tiles as "Wall_BaseColor.1001.png" (dot, not
+    underscore). Without stripping the ".1001" every tile became its own
+    texture set, so a mesh matched a single tile and UDIM never collapsed."""
+    strip = core_module.DEFAULT_CONFIG["suffix_strip_list"]
+    assert core_module.tex_base_name("Wall_BaseColor.1001.png", strip) == "Wall"
+    assert core_module.tex_base_name("Wall_Normal.1002.exr", strip) == "Wall"
+    assert core_module.tex_base_name("Wall_BaseColor_1001.png", strip) == "Wall"
+
+
+def test_scan_and_match_collapse_dot_separated_udim_tiles(core_module, tmp_path):
+    for map_name in ("BaseColor", "Normal"):
+        for tile in (1001, 1002):
+            (tmp_path / f"Wall_{map_name}.{tile}.png").write_bytes(b"")
+
+    config = core_module.DEFAULT_CONFIG
+    tex_map = core_module.scan_texture_folder(str(tmp_path), config["suffix_strip_list"])
+    assert list(tex_map) == ["Wall"]
+
+    match = core_module.match_objects_to_textures([("SM_Wall", None)], tex_map, config)[0]
+    assert match["tex_base"] == "Wall"
+    for map_id, map_name in (("baseColor", "BaseColor"), ("normal", "Normal")):
+        channel = match["channels"][map_id]
+        assert channel["is_udim"] is True
+        assert channel["file"].endswith(f"Wall_{map_name}.<UDIM>.png")
+
+
+def test_similarity_scores_a_full_word_match_above_a_bare_substring(core_module):
+    """The real case that made a wrong match look as confident as a right one:
+    "Boca" is a WORD of "Modelado2_Boca" but only a tail of
+    "Modelado2_TornilloBoca"."""
+    good = core_module.similarity("Boca", "Modelado2_Boca")
+    bad = core_module.similarity("Boca", "Modelado2_TornilloBoca")
+    assert good >= 0.90
+    assert bad < good
+    # ...and the weaker the overlap, the lower the number (it used to be a
+    # flat 0.85 for both, so the sensitivity slider could not tell them apart)
+    assert bad <= 0.90
+
+
+def test_similarity_is_1_for_the_same_name_however_it_is_written(core_module):
+    assert core_module.similarity("Rock", "Rock") == 1.0
+    assert core_module.similarity("Rock_Large", "rock-large") == 1.0
+
+
+def test_similarity_still_tolerates_typos(core_module):
+    """What the fuzzy ratio is actually for: "brazos" vs a set exported as
+    "Braxos". Neither a word nor a substring match, so it must not be capped."""
+    assert core_module.similarity("brazos", "Braxos") > 0.60
+
+
+def test_similarity_rates_an_unrelated_name_low(core_module):
+    assert core_module.similarity("Zzz", "Character") < 0.60
+
+
+def test_compute_matches_breaks_ties_the_same_way_whatever_the_folder_order(core_module):
+    """Two sets that both contain the object's name used to score exactly the
+    same, so the winner was whichever the folder happened to list first."""
+    sets = ["Modelado2_Cabeza", "Modelado2_CabezaExtra"]
+    for candidates in (sets, list(reversed(sets))):
+        results = core_module.compute_matches(["Cabeza"], candidates, threshold=0.60)
+        assert results[0][1] == "Modelado2_Cabeza", candidates
+
+
+def test_compute_matches_prefers_the_exact_name_over_a_longer_one(core_module):
+    results = core_module.compute_matches(["Rock"], ["Rock_Large", "Rock"], threshold=0.60)
+    assert results[0][1] == "Rock"
+    assert results[0][2] == 1.0
+
+
 def test_bucket_files_by_type_first_match_wins_and_tracks_unmatched(core_module):
     files = ["/t/Wall_BaseColor.png", "/t/Wall_Roughness.png", "/t/Wall_Unknown.tiff"]
     buckets, unmatched = core_module.bucket_files_by_type(
