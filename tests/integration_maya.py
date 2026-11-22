@@ -91,13 +91,10 @@ def make_textures(folder):
     write_png(os.path.join(folder, "Cliff_Height.png"))
 
 
-def apply_to(ta, build, objects, folder, config):
-    """Scan + match + apply, through whichever entry points this build has."""
-    if build == "standalone":
-        tex_map = ta.scan_texture_folder(folder, config["suffix_strip_list"],
-                                         set(config["texture_extensions"]))
-    else:
-        tex_map = ta.scan_folder(folder, config)
+def apply_to(ta, objects, folder, config):
+    """Scan + match + apply. Both builds expose the same entry points now
+    that the single-file one is generated from the modular sources."""
+    tex_map = ta.scan_folder(folder, config)
     matches = ta.match_objects_to_textures(objects, tex_map, config)
     ta.apply_auto_textures(matches, config)
     return matches
@@ -116,12 +113,11 @@ def run(build, tmp):
              cmds.pluginInfo("mtoa", query=True, loaded=True)))
     print("  config/state/log go to: %s" % ta._app_dir())
 
-    config = (ta.load_config() if build == "standalone"
-              else ta.core.load_config(ta._app_dir(), warn_fn=ta._warn))
+    config = ta._load_config()
 
     rock = cmds.polyCube(name="SM_Rock")[0]
     crate = cmds.polyCube(name="SM_Crate2048")[0]
-    apply_to(ta, build, [rock, crate], tex, config)
+    apply_to(ta, [rock, crate], tex, config)
 
     # ── The standard set ────────────────────────────────────────
     shader = ta._find_autoloader_shader(rock)
@@ -158,7 +154,7 @@ def run(build, tmp):
     # ── Displacement, opted in ──────────────────────────────────
     cliff = cmds.polyCube(name="SM_Cliff")[0]
     disp_config = dict(config, enable_displacement_wiring=True)
-    apply_to(ta, build, [cliff], tex, disp_config)
+    apply_to(ta, [cliff], tex, disp_config)
     shader = ta._find_autoloader_shader(cliff)
     sg = (cmds.listConnections("%s.outColor" % shader, type="shadingEngine") or [None])[0] \
         if shader else None
@@ -178,7 +174,7 @@ def run(build, tmp):
         {"id": "specular", "match": ["_specular"], "color_space": "Raw", "raw": True}]
     custom["suffix_strip_list"] = list(config["suffix_strip_list"]) + ["specular"]
     before = set(cmds.ls(type="file") or [])
-    apply_to(ta, build, [gem], tex, custom)
+    apply_to(ta, [gem], tex, custom)
     new_files = [n for n in (cmds.ls(type="file") or []) if n not in before]
     dangling = [n for n in new_files
                 if not (cmds.listConnections(n + ".outColor", destination=True,
