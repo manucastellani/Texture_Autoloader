@@ -91,6 +91,21 @@ def test_has_autoloader_material_false_for_foreign_material(ta):
     assert ta.has_autoloader_material("SM_Character") is False
 
 
+def test_folder_picker_accepts_only_where_the_module_lives(ta, tmp_path):
+    """Pasted into the Script Editor, the tool asks for its folder. Picking
+    the build root or its core/ used to be accepted as-is (core/ even
+    "worked"), leaving config/state/log in the wrong place."""
+    import os
+    maya_dir = os.path.normpath(str(tmp_path / "maya"))  # the fixture's copy of the module
+    assert ta._find_module_dir(maya_dir) == maya_dir
+    assert ta._find_module_dir(str(tmp_path)) == maya_dir
+    assert ta._find_module_dir(str(tmp_path / "core")) == maya_dir
+    assert ta._find_module_dir(str(tmp_path / "core") + os.sep) == maya_dir
+    unrelated = tmp_path / "Documents" / "maya_projects"  # not part of the build
+    unrelated.mkdir(parents=True)
+    assert ta._find_module_dir(str(unrelated)) is None
+
+
 def test_config_and_state_are_isolated_from_the_real_repo(ta, tmp_path):
     """El módulo bajo test debe resolver su config/estado dentro de la
     copia temporal (junto a su propio __file__), nunca en el repo real."""

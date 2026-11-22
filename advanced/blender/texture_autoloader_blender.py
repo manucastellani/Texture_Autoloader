@@ -116,10 +116,62 @@ if not core.HAS_RAPIDFUZZ:
 
 _TEX_MAP: Dict[str, List[str]] = {}
 _MATCHES: List[Dict[str, Any]] = []
+_LAST_REPORT: str = ""
+
+REPORT_TEXT_NAME = "TextureAutoloader_Report"
+
+
+def _publish_report(report: str) -> str:
+    """Deja el reporte ✔/✘ donde se pueda leer después de cerrar el popup:
+    en la consola, en texture_autoloader.log y en un bloque de texto del
+    .blend (Text Editor). Devuelve el nombre de ese bloque de texto."""
+    global _LAST_REPORT
+    _LAST_REPORT = report
+    print(report)
+    try:
+        core.get_logger(_app_dir()).info("\n" + report)
+    except Exception:
+        pass
+    text = bpy.data.texts.get(REPORT_TEXT_NAME) or bpy.data.texts.new(REPORT_TEXT_NAME)
+    text.clear()
+    text.write(report)
+    return text.name
 
 
 def _config() -> Dict[str, Any]:
     return core.load_config(_app_dir(), warn_fn=_warn)
+
+
+def _effective_config(props) -> Dict[str, Any]:
+    """Config de disco + el preset de nombres elegido en el panel."""
+    return core.apply_naming_preset(_config(), props.naming_preset, warn_fn=_warn)
+
+
+# Strings que describen la interacción de ESTA UI, no la de Maya: el texto
+# compartido habla de doble click (el árbol de Qt), que en el panel de Blender
+# no existe. Ver core.apply_text_overrides.
+_BLENDER_TEXT_OVERRIDES = {
+    "en": {
+        "section_autoloader_desc": (
+            "Scan a folder, match meshes to texture sets by name, and apply in "
+            "batch. Use the reassign menu to change an object's whole set; toggle "
+            "a channel button to enable/disable just that map."
+        ),
+        "btn_browse": "SCAN FOLDER",
+        "preview_label": "PREVIEW",
+    },
+    "es": {
+        "section_autoloader_desc": (
+            "Escaneá una carpeta, empareja meshes por nombre y aplicá en batch. "
+            "Usá el menú de reasignar para cambiar el set completo de un objeto; "
+            "el botón de cada canal lo activa/desactiva."
+        ),
+        "btn_browse": "ESCANEAR CARPETA",
+        "preview_label": "PREVIEW",
+    },
+}
+
+core.apply_text_overrides(_BLENDER_TEXT_OVERRIDES)
 
 
 def _t(key: str, **kwargs) -> str:
@@ -178,9 +230,10 @@ def _udim_tiles_from_disk(representative_path: str) -> Dict[int, str]:
     necesita registrar cada tile a mano (a diferencia de Arnold, que
     resuelve el token <UDIM> por convención en el momento del render).
 
-    El número se lee en la posición del token (ver core.get_udim_tile_files),
-    no como "el primer grupo de 4 dígitos del nombre": con eso, un asset como
-    "Crate2048_BaseColor.1001.png" se registraba como tile 2048."""
+    El número de tile se lee en la posición del token (ver
+    core.get_udim_tile_files), no como "el primer grupo de 4 dígitos del
+    nombre": con eso, un asset como "Crate2048_BaseColor.1001.png" se
+    registraba como tile 2048."""
     folder = os.path.dirname(representative_path)
     try:
         names = os.listdir(folder)
@@ -235,13 +288,6 @@ _COLORSPACE_ALIASES = {
     "srgb": "sRGB",
 }
 
-# Tipos de mapa que esta versión sabe cablear: un `map_types` extendido a mano
-# en el config puede traer ids que acá no existen (ver process_textures).
-WIRED_MAP_TYPES = frozenset({
-    "baseColor", "roughness", "metallic", "normal", "emission", "ao",
-    "displacement", "opacity",
-})
-
 
 def _colorspace_for(map_id: str, config: Dict[str, Any], default: str) -> str:
     """Color space del config para ese canal, traducido a como lo llama
@@ -287,16 +333,25 @@ def _cleanup_existing_material(obj: "bpy.types.Object") -> int:
         return 0
 
 
+def _color_socket(sockets, name: str) -> "bpy.types.NodeSocket":
+    """El nodo Mix tiene sockets float / vector / color que comparten el
+    nombre ("A", "B", "Result"): pedimos explícitamente el de color en vez
+    de confiar en qué devuelve sockets[name] en cada versión de Blender."""
+    return next((s for s in sockets if s.name == name and s.type == 'RGBA'), sockets[name])
+
+
 def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, str],
-                      config: Dict[str, Any]) -> None:
+                      config: Dict[str, Any]) -> Dict[str, Any]:
     """Crea un material Principled BSDF NUEVO, lo asigna al objeto (único
     slot — reemplaza cualquier asignación anterior) y conecta las
     texturas por tipo de mapa. Si el objeto ya tenía un material generado
-    por esta herramienta, lo limpia primero."""
+    por esta herramienta, lo limpia primero.
+
+    Devuelve un core.new_apply_result(): qué canal quedó cableado, cuál
+    se salteó y por qué, y cuál falló — de ahí sale el reporte ✔/✘."""
     obj = bpy.data.objects.get(obj_name)
     if obj is None:
-        _warn(f"[TextureAutoloader] Object '{obj_name}' not found in the scene — skipped.")
-        return
+        raise RuntimeError(f"object '{obj_name}' not found in the scene")
 
     _cleanup_existing_material(obj)
 
@@ -315,84 +370,84 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
     obj.data.materials.clear()
     obj.data.materials.append(mat)
 
+    result = core.new_apply_result(material=mat.name)
     base_color_node = None
     ao_node = None
     y = 400
     skipped_displacement = 0
-    unsupported: List[str] = []
+
+    def link_to(node, socket, map_id, file_path, output_name="Color") -> None:
+        """Conecta y anota el canal en el resultado: sin imagen = falló la
+        carga; sin socket = el Principled BSDF de esta versión no lo tiene."""
+        if node is None:
+            result["failed"][map_id] = f"could not load {os.path.basename(file_path)}"
+        elif socket is None:
+            result["skipped"][map_id] = {"reason": "no_target", "target": "Principled BSDF"}
+        else:
+            node_tree.links.new(node.outputs[output_name], socket)
+            result["wired"][map_id] = file_path
 
     for map_id, file_path in channel_files.items():
         is_udim = "<UDIM>" in file_path
 
         if map_id == "displacement" and not config.get("enable_displacement_wiring", False):
             skipped_displacement += 1
+            result["skipped"][map_id] = {"reason": "displacement_off"}
             continue
 
         if map_id == "baseColor":
             node = _add_image_node(
                 node_tree, file_path, is_udim,
                 _colorspace_for(map_id, config, "sRGB"), "Base Color", -400, y)
-            if node:
-                base_color_node = node
-                socket = _socket(bsdf, "Base Color")
-                if socket:
-                    node_tree.links.new(node.outputs["Color"], socket)
+            base_color_node = node
+            link_to(node, _socket(bsdf, "Base Color"), map_id, file_path)
 
         elif map_id == "roughness":
             node = _add_image_node(
                 node_tree, file_path, is_udim,
                 _colorspace_for(map_id, config, "Non-Color"), "Roughness", -400, y)
-            if node:
-                socket = _socket(bsdf, "Roughness")
-                if socket:
-                    node_tree.links.new(node.outputs["Color"], socket)
+            link_to(node, _socket(bsdf, "Roughness"), map_id, file_path)
 
         elif map_id == "metallic":
             node = _add_image_node(
                 node_tree, file_path, is_udim,
                 _colorspace_for(map_id, config, "Non-Color"), "Metallic", -400, y)
-            if node:
-                socket = _socket(bsdf, "Metallic")
-                if socket:
-                    node_tree.links.new(node.outputs["Color"], socket)
+            link_to(node, _socket(bsdf, "Metallic"), map_id, file_path)
 
         elif map_id == "normal":
             node = _add_image_node(
                 node_tree, file_path, is_udim,
                 _colorspace_for(map_id, config, "Non-Color"), "Normal", -600, y)
+            normal_map = None
             if node:
                 normal_map = node_tree.nodes.new("ShaderNodeNormalMap")
                 normal_map.location = (-350, y)
                 node_tree.links.new(node.outputs["Color"], normal_map.inputs["Color"])
-                socket = _socket(bsdf, "Normal")
-                if socket:
-                    node_tree.links.new(normal_map.outputs["Normal"], socket)
+            link_to(normal_map if node else None, _socket(bsdf, "Normal"), map_id, file_path,
+                    output_name="Normal")
 
         elif map_id == "emission":
             node = _add_image_node(
                 node_tree, file_path, is_udim,
                 _colorspace_for(map_id, config, "sRGB"), "Emission", -400, y)
-            if node:
-                color_socket = _socket(bsdf, "Emission Color", "Emission")
-                if color_socket:
-                    node_tree.links.new(node.outputs["Color"], color_socket)
-                strength_socket = _socket(bsdf, "Emission Strength")
-                if strength_socket:
-                    strength_socket.default_value = 1.0
+            link_to(node, _socket(bsdf, "Emission Color", "Emission"), map_id, file_path)
+            strength_socket = _socket(bsdf, "Emission Strength")
+            if node and strength_socket:
+                strength_socket.default_value = 1.0
 
         elif map_id == "ao":
             ao_node = _add_image_node(
                 node_tree, file_path, is_udim,
                 _colorspace_for(map_id, config, "Non-Color"), "AO", -400, y)
+            if ao_node is None:
+                result["failed"][map_id] = f"could not load {os.path.basename(file_path)}"
 
         elif map_id == "opacity":
             node = _add_image_node(
                 node_tree, file_path, is_udim,
                 _colorspace_for(map_id, config, "Non-Color"), "Opacity", -400, y)
+            link_to(node, _socket(bsdf, "Alpha"), map_id, file_path)
             if node:
-                socket = _socket(bsdf, "Alpha")
-                if socket:
-                    node_tree.links.new(node.outputs["Color"], socket)
                 # Blender's transparency handling has changed across
                 # versions (blend_method was removed from EEVEE Next in
                 # 4.2). Best-effort: set it only if the attribute exists.
@@ -405,22 +460,25 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
             node = _add_image_node(
                 node_tree, file_path, is_udim,
                 _colorspace_for(map_id, config, "Non-Color"), "Displacement", -400, y)
+            disp_node = None
             if node:
                 disp_node = node_tree.nodes.new("ShaderNodeDisplacement")
                 disp_node.location = (150, -300)
                 node_tree.links.new(node.outputs["Color"], disp_node.inputs["Height"])
-                node_tree.links.new(disp_node.outputs["Displacement"], output.inputs["Displacement"])
                 # True displacement only renders correctly in Cycles with
                 # adaptive subdivision on the mesh — this wires the graph
                 # but doesn't configure that for you, same conservative
                 # stance as the Maya version's "detected but not
                 # automatically deformed" behavior.
+            link_to(disp_node, output.inputs["Displacement"], map_id, file_path,
+                    output_name="Displacement")
 
         else:
             # Un map type agregado a mano en el config (algo que el README
-            # invita a hacer): no hay regla para cablearlo, así que se avisa
-            # en vez de ignorarlo en silencio.
-            unsupported.append(map_id)
+            # invita a hacer): no hay regla para cablearlo, así que se reporta
+            # en vez de ignorarlo en silencio, y no se crea ningún nodo.
+            result["skipped"][map_id] = {"reason": "no_target",
+                                          "target": "Principled BSDF"}
 
         y -= 260
 
@@ -431,21 +489,18 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
         mix_node.blend_type = 'MULTIPLY'
         mix_node.inputs["Factor"].default_value = 1.0
         mix_node.location = (-150, 400)
+        input_a = _color_socket(mix_node.inputs, "A")
         if base_color_node is not None:
-            node_tree.links.new(base_color_node.outputs["Color"], mix_node.inputs["A"])
+            node_tree.links.new(base_color_node.outputs["Color"], input_a)
         else:
-            mix_node.inputs["A"].default_value = (1.0, 1.0, 1.0, 1.0)
-        node_tree.links.new(ao_node.outputs["Color"], mix_node.inputs["B"])
+            input_a.default_value = (1.0, 1.0, 1.0, 1.0)
+        node_tree.links.new(ao_node.outputs["Color"], _color_socket(mix_node.inputs, "B"))
         base_socket = _socket(bsdf, "Base Color")
         if base_socket:
-            node_tree.links.new(mix_node.outputs["Result"], base_socket)
-
-    if unsupported:
-        _warn(
-            f"[TextureAutoloader] map type(s) {', '.join(sorted(set(unsupported)))} come from "
-            f"texture_autoloader_config.json but this addon has no wiring rule for them, so "
-            f"they were NOT applied to {obj.name} (supported: "
-            f"{', '.join(sorted(WIRED_MAP_TYPES))}).")
+            node_tree.links.new(_color_socket(mix_node.outputs, "Result"), base_socket)
+            result["wired"]["ao"] = channel_files["ao"]
+        else:
+            result["skipped"]["ao"] = {"reason": "no_target", "target": "Principled BSDF"}
 
     if skipped_displacement:
         _warn(
@@ -456,8 +511,9 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
             f"subdivision to look right).")
 
     core.get_logger(_app_dir()).info(
-        f"[TextureAutoloader] Material '{mat_name}' applied to {obj.name} "
-        f"with {len(channel_files)} channel(s) requested.")
+        f"[TextureAutoloader] Material '{mat.name}' applied to {obj.name} "
+        f"with {len(result['wired'])} of {len(channel_files)} channel(s) wired.")
+    return result
 
 
 # ══════════════════════════════════════════════════════════════
@@ -491,6 +547,29 @@ def _on_recursive_update(self, context):
     core.save_state(_app_dir(), state)
 
 
+# Blender necesita que los strings de un EnumProperty dinámico sigan
+# vivos después de devolverlos (si no, el menú muestra basura): se
+# guardan acá en vez de en una lista temporal.
+_NAMING_PRESET_ITEMS: List[Tuple[str, str, str]] = []
+
+
+def _naming_preset_items(self, context):
+    global _NAMING_PRESET_ITEMS
+    tooltip = core.tr(self.language, "naming_preset_tooltip")
+    _NAMING_PRESET_ITEMS = [(preset_id, label, tooltip)
+                            for preset_id, label in core.list_naming_presets(_config(), self.language)]
+    return _NAMING_PRESET_ITEMS
+
+
+def _on_naming_preset_update(self, context):
+    state = core.load_state(_app_dir())
+    state["last_naming_preset"] = self.naming_preset
+    core.save_state(_app_dir(), state)
+    # El agrupamiento en sets depende de los sufijos: re-escanear.
+    if self.folder:
+        _scan_folder(self)
+
+
 class TEXTUREAUTOLOADER_PG_properties(PropertyGroup):
     folder: StringProperty(
         name="Folder", subtype='DIR_PATH', default="")
@@ -514,6 +593,11 @@ class TEXTUREAUTOLOADER_PG_properties(PropertyGroup):
         default="en",
         update=_on_language_update,
     )
+    naming_preset: EnumProperty(
+        name="Naming preset",
+        items=_naming_preset_items,
+        update=_on_naming_preset_update,
+    )
     scan_info: StringProperty(name="Scan info", default="")
     match_status: StringProperty(name="Match status", default="")
 
@@ -522,10 +606,32 @@ class TEXTUREAUTOLOADER_PG_properties(PropertyGroup):
 #  Operators
 # ══════════════════════════════════════════════════════════════
 
-class TEXTUREAUTOLOADER_OT_toggle_language(Operator):
+class _TranslatedTooltip:
+    """Tooltip que sigue el idioma del panel.
+
+    Blender congela el `bl_description` de un operator cuando se registra el
+    addon, así que con el panel en español el texto al pasar el mouse seguía
+    en inglés. Devolverlo desde `description()` hace que Blender lo pida en el
+    momento de dibujar, ya traducido. El `bl_description` se mantiene como
+    fallback en inglés: el buscador de operators (F3) lo lee sin contexto.
+    """
+
+    tooltip_key = ""
+
+    @classmethod
+    def description(cls, context, properties):
+        scene = getattr(context, "scene", None) if context is not None else None
+        props = getattr(scene, "texture_autoloader", None)
+        language = getattr(props, "language", None) or core.DEFAULT_LANGUAGE
+        if not cls.tooltip_key:
+            return cls.bl_description
+        return core.tr(language, cls.tooltip_key)
+
+class TEXTUREAUTOLOADER_OT_toggle_language(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.toggle_language"
     bl_label = "Toggle language"
     bl_description = "Switch the panel between English and Spanish"
+    tooltip_key = "tip_toggle_language"
 
     def execute(self, context):
         props = context.scene.texture_autoloader
@@ -533,9 +639,11 @@ class TEXTUREAUTOLOADER_OT_toggle_language(Operator):
         return {'FINISHED'}
 
 
-class TEXTUREAUTOLOADER_OT_browse_folder(Operator):
+class TEXTUREAUTOLOADER_OT_browse_folder(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.browse_folder"
     bl_label = "Select texture folder"
+    bl_description = "Pick the folder with the textures exported from Substance"
+    tooltip_key = "tip_browse_folder"
     directory: StringProperty(subtype='DIR_PATH')
 
     def invoke(self, context, event):
@@ -548,9 +656,11 @@ class TEXTUREAUTOLOADER_OT_browse_folder(Operator):
         return {'FINISHED'}
 
 
-class TEXTUREAUTOLOADER_OT_select_recent(Operator):
+class TEXTUREAUTOLOADER_OT_select_recent(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.select_recent"
     bl_label = "Recent folder"
+    bl_description = "Load this folder again"
+    tooltip_key = "tip_select_recent"
     path: StringProperty()
 
     def execute(self, context):
@@ -575,48 +685,57 @@ class TEXTUREAUTOLOADER_MT_recent_folders(Menu):
             op.path = path
 
 
-class TEXTUREAUTOLOADER_OT_scan_folder(Operator):
+class TEXTUREAUTOLOADER_OT_scan_folder(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.scan_folder"
     bl_label = "Scan folder"
     bl_description = "Scan the selected folder for texture sets"
+    tooltip_key = "tip_scan_folder"
 
     def execute(self, context):
-        global _TEX_MAP, _MATCHES
-        props = context.scene.texture_autoloader
-        folder = props.folder
-
-        # Blender's DIR_PATH StringProperty stores paths like "//textures/"
-        # (blend-relative) or with a trailing separator — normalize both.
-        folder = bpy.path.abspath(folder)
-
-        if not folder or not os.path.isdir(folder):
-            self.report({'WARNING'}, _t("msg_folder_missing", folder=folder or "(empty)"))
+        error = _scan_folder(context.scene.texture_autoloader)
+        if error:
+            self.report({'WARNING'}, error)
             return {'CANCELLED'}
-
-        config = _config()
-        _TEX_MAP = core.scan_texture_folder(
-            folder, config["suffix_strip_list"], set(config["texture_extensions"]),
-            recursive=props.recursive)
-        _MATCHES = []
-
-        total_files = sum(len(v) for v in _TEX_MAP.values())
-        props.scan_info = _t("scan_info", sets=len(_TEX_MAP), files=total_files)
-        props.match_status = ""
-
-        state = core.load_state(_app_dir())
-        recent = core.push_recent_folder(state.get("recent_folders", []), folder)
-        state["recent_folders"] = recent
-        state["last_recursive"] = props.recursive
-        core.save_state(_app_dir(), state)
-
-        _log_print(f"[TextureAutoloader] Loaded {len(_TEX_MAP)} set(s) from: {folder}")
         return {'FINISHED'}
 
 
-class TEXTUREAUTOLOADER_OT_smart_match(Operator):
+def _scan_folder(props) -> Optional[str]:
+    """Escanea props.folder con el preset de nombres elegido. Devuelve un
+    mensaje de error, o None si salió bien. Separado del operator para
+    poder re-escanear también al cambiar de preset."""
+    global _TEX_MAP, _MATCHES
+    # Blender's DIR_PATH StringProperty stores paths like "//textures/"
+    # (blend-relative) or with a trailing separator — normalize both.
+    folder = bpy.path.abspath(props.folder)
+
+    if not folder or not os.path.isdir(folder):
+        return _t("msg_folder_missing", folder=folder or "(empty)")
+
+    config = _effective_config(props)
+    _TEX_MAP = core.scan_texture_folder(
+        folder, config["suffix_strip_list"], set(config["texture_extensions"]),
+        recursive=props.recursive)
+    _MATCHES = []
+
+    total_files = sum(len(v) for v in _TEX_MAP.values())
+    props.scan_info = _t("scan_info", sets=len(_TEX_MAP), files=total_files)
+    props.match_status = ""
+
+    state = core.load_state(_app_dir())
+    recent = core.push_recent_folder(state.get("recent_folders", []), folder)
+    state["recent_folders"] = recent
+    state["last_recursive"] = props.recursive
+    core.save_state(_app_dir(), state)
+
+    _log_print(f"[TextureAutoloader] Loaded {len(_TEX_MAP)} set(s) from: {folder}")
+    return None
+
+
+class TEXTUREAUTOLOADER_OT_smart_match(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.smart_match"
     bl_label = "Smart Match"
     bl_description = "Match the selected mesh objects to the scanned texture sets"
+    tooltip_key = "tip_smart_match"
 
     def execute(self, context):
         global _MATCHES
@@ -630,7 +749,7 @@ class TEXTUREAUTOLOADER_OT_smart_match(Operator):
             self.report({'WARNING'}, _t("msg_load_folder_first"))
             return {'CANCELLED'}
 
-        config = _config()
+        config = _effective_config(context.scene.texture_autoloader)
         object_entries: List[Tuple[str, Optional[str]]] = []
         for obj in selected:
             assigned = _get_assigned_material_name(obj) if props.match_mode == "material_id" else None
@@ -646,9 +765,11 @@ class TEXTUREAUTOLOADER_OT_smart_match(Operator):
         return {'FINISHED'}
 
 
-class TEXTUREAUTOLOADER_OT_toggle_channel(Operator):
+class TEXTUREAUTOLOADER_OT_toggle_channel(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.toggle_channel"
     bl_label = "Toggle channel"
+    bl_description = "Enable or disable this map for this object"
+    tooltip_key = "tip_toggle_channel"
     match_index: IntProperty()
     map_id: StringProperty()
 
@@ -660,10 +781,11 @@ class TEXTUREAUTOLOADER_OT_toggle_channel(Operator):
         return {'FINISHED'}
 
 
-class TEXTUREAUTOLOADER_OT_remove_match(Operator):
+class TEXTUREAUTOLOADER_OT_remove_match(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.remove_match"
     bl_label = "Remove from batch"
     bl_description = "Remove this object from the batch without deleting anything in the scene"
+    tooltip_key = "tip_remove_match"
     match_index: IntProperty()
 
     def execute(self, context):
@@ -673,16 +795,18 @@ class TEXTUREAUTOLOADER_OT_remove_match(Operator):
         return {'FINISHED'}
 
 
-class TEXTUREAUTOLOADER_OT_reassign_match(Operator):
+class TEXTUREAUTOLOADER_OT_reassign_match(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.reassign_match"
     bl_label = "Reassign texture set"
+    bl_description = "Use this texture set for the object instead"
+    tooltip_key = "tip_reassign_match"
     match_index: IntProperty()
     tex_base: StringProperty()
 
     def execute(self, context):
         global _MATCHES
         if 0 <= self.match_index < len(_MATCHES):
-            config = _config()
+            config = _effective_config(context.scene.texture_autoloader)
             m = _MATCHES[self.match_index]
             new_base = self.tex_base or None
             _MATCHES[self.match_index] = core.build_match_entry(
@@ -707,9 +831,11 @@ class TEXTUREAUTOLOADER_MT_reassign(Menu):
             op.tex_base = tex_base
 
 
-class TEXTUREAUTOLOADER_OT_open_reassign_menu(Operator):
+class TEXTUREAUTOLOADER_OT_open_reassign_menu(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.open_reassign_menu"
     bl_label = "Reassign"
+    bl_description = "Choose another texture set for this object"
+    tooltip_key = "tip_open_reassign_menu"
     match_index: IntProperty()
 
     def execute(self, context):
@@ -718,17 +844,18 @@ class TEXTUREAUTOLOADER_OT_open_reassign_menu(Operator):
         return {'FINISHED'}
 
 
-class TEXTUREAUTOLOADER_OT_apply_all(Operator):
+class TEXTUREAUTOLOADER_OT_apply_all(_TranslatedTooltip, Operator):
     bl_idname = "texture_autoloader.apply_all"
     bl_label = "Apply to all matches"
     bl_description = "Wire a Principled BSDF for every matched object in the batch"
+    tooltip_key = "tip_apply_all"
 
     def execute(self, context):
         if not _MATCHES:
             self.report({'WARNING'}, _t("msg_run_smart_match_first"))
             return {'CANCELLED'}
 
-        config = _config()
+        config = _effective_config(context.scene.texture_autoloader)
         conflicts = [m["obj"] for m in _MATCHES if m["tex_base"]
                      and bpy.data.objects.get(m["obj"])
                      and has_autoloader_material(bpy.data.objects[m["obj"]])]
@@ -743,23 +870,47 @@ class TEXTUREAUTOLOADER_OT_apply_all(Operator):
                 {'INFO'},
                 _t("dialog_existing_materials_body", count=len(conflicts)).replace("\n\n", " "))
 
-        def _apply_one(obj_name: str, mat_basename: str, channel_files: Dict[str, str]) -> None:
-            process_textures(obj_name, mat_basename, channel_files, config)
+        def _apply_one(obj_name: str, mat_basename: str,
+                       channel_files: Dict[str, str]) -> Dict[str, Any]:
+            return process_textures(obj_name, mat_basename, channel_files, config)
 
         applied, skipped = core.apply_auto_textures(
             _MATCHES, config, apply_one_fn=_apply_one, log_fn=_log_print)
 
+        language = context.scene.texture_autoloader.language
+        text_name = _publish_report(core.build_report(_MATCHES, language, tex_map=_TEX_MAP))
         self.report(
             {'INFO'},
-            f"{_t('done_body_applied')}: {applied}    {_t('done_body_skipped')}: {skipped}")
+            f"{_t('done_body_applied')}: {applied}    {_t('done_body_skipped')}: {skipped}    "
+            f"{_t('report_in_text_editor', name=text_name)}")
         return {'FINISHED'}
 
 
-class TEXTUREAUTOLOADER_OT_manual_apply(Operator):
+class TEXTUREAUTOLOADER_OT_show_report(_TranslatedTooltip, Operator):
+    bl_idname = "texture_autoloader.show_report"
+    bl_label = "Texture Autoloader — report"
+    bl_description = "Show the ✔/✘ report of the last run"
+    tooltip_key = "tip_show_report"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_popup(self, width=720)
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        for line in (_LAST_REPORT or "").splitlines():
+            col.label(text=line or " ")
+
+
+class TEXTUREAUTOLOADER_OT_manual_apply(_TranslatedTooltip, Operator):
     """Modo manual: aplica archivos elegidos a mano al objeto activo,
     sin pasar por el escaneo/matching del Auto-Loader."""
     bl_idname = "texture_autoloader.manual_apply"
     bl_label = "Select files and apply"
+    bl_description = "Pick texture files by hand and apply them to the active object"
+    tooltip_key = "tip_manual_apply"
     filepath: StringProperty(subtype='FILE_PATH')
     files: bpy.props.CollectionProperty(type=bpy.types.OperatorFileListElement)
     directory: StringProperty(subtype='DIR_PATH')
@@ -775,18 +926,24 @@ class TEXTUREAUTOLOADER_OT_manual_apply(Operator):
 
     def execute(self, context):
         obj = context.active_object
-        config = _config()
+        config = _effective_config(context.scene.texture_autoloader)
         file_paths = [os.path.join(self.directory, f.name) for f in self.files]
         if not file_paths:
             return {'CANCELLED'}
 
-        buckets, unmatched = core.bucket_files_by_type(file_paths, config["map_types"])
-        resolved = core.resolve_channel_files(buckets, config, warn_fn=_warn)
-        channel_files = {mid: fp for mid, (fp, _is_udim) in resolved.items()}
+        label = core.tex_base_name(os.path.basename(file_paths[0]), config["suffix_strip_list"])
+        entry = core.build_entry_from_files(obj.name, label, file_paths, config, warn_fn=_warn)
+        channel_files = {mid: ch["file"] for mid, ch in entry["channels"].items()}
+        try:
+            entry["result"] = process_textures(obj.name, obj.name, channel_files, config)
+            entry["status"] = "applied"
+        except Exception as e:
+            entry["status"], entry["error"] = "error", str(e)
 
-        process_textures(obj.name, obj.name, channel_files, config)
-        if unmatched:
-            self.report({'WARNING'}, f"{len(unmatched)} file(s) not recognized and not wired.")
+        text_name = _publish_report(
+            core.build_report([entry], context.scene.texture_autoloader.language))
+        self.report({'WARNING'} if entry["unrecognized"] or entry["status"] == "error" else {'INFO'},
+                    _t("report_in_text_editor", name=text_name))
         return {'FINISHED'}
 
 
@@ -823,6 +980,13 @@ class TEXTUREAUTOLOADER_PT_main(Panel):
         lang_row.operator(
             TEXTUREAUTOLOADER_OT_toggle_language.bl_idname,
             text=core.tr(core.other_language(L), "lang_button"))
+
+        layout.separator()
+
+        # ── Settings (afectan al modo manual y al Auto-Loader) ──
+        box = layout.box()
+        box.label(text="◇  " + core.tr(L, "section_settings"))
+        box.prop(props, "naming_preset", text=core.tr(L, "naming_preset_label"))
 
         layout.separator()
 
@@ -902,6 +1066,10 @@ class TEXTUREAUTOLOADER_PT_main(Panel):
 
         box.operator(TEXTUREAUTOLOADER_OT_apply_all.bl_idname,
                      text=core.tr(L, "btn_apply_all"), icon='PLAY')
+        if _LAST_REPORT:
+            box.label(text=_LAST_REPORT.splitlines()[-1])
+            box.operator(TEXTUREAUTOLOADER_OT_show_report.bl_idname,
+                         text=core.tr(L, "btn_show_report"), icon='TEXT')
 
         layout.separator()
         footer_row = layout.row()
@@ -927,6 +1095,7 @@ _CLASSES = (
     TEXTUREAUTOLOADER_MT_reassign,
     TEXTUREAUTOLOADER_OT_open_reassign_menu,
     TEXTUREAUTOLOADER_OT_apply_all,
+    TEXTUREAUTOLOADER_OT_show_report,
     TEXTUREAUTOLOADER_OT_manual_apply,
     TEXTUREAUTOLOADER_PT_main,
 )
@@ -953,6 +1122,10 @@ def register():
             props.threshold = state.get("last_threshold", config.get("match_threshold", 0.60))
             props.match_mode = state.get("last_match_mode", config.get("match_mode", "object_name"))
             props.recursive = bool(state.get("last_recursive", False))
+            preset = core.apply_naming_preset(
+                config, state.get("last_naming_preset", config.get("naming_preset")),
+                warn_fn=_warn)["naming_preset"]
+            props.naming_preset = preset
     except Exception:
         pass
 

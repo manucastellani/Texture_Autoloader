@@ -185,6 +185,25 @@ def run(tmp):
     got = addon._MATCHES[0]["tex_base"] if addon._MATCHES else None
     check(got == "Rock", "Material ID mode still matches M_Rock_TXA to Rock (%s)" % got)
 
+    # ── Tooltips and panel text follow the panel's language ────
+    #  Blender freezes bl_description when the addon registers, so the hover
+    #  text used to stay in English with the panel set to Spanish.
+    operator = addon.TEXTUREAUTOLOADER_OT_smart_match
+    props.language = "es"
+    tip_es = operator.description(bpy.context, None)
+    desc_es = addon._t("section_autoloader_desc")
+    props.language = "en"
+    tip_en = operator.description(bpy.context, None)
+    check(tip_es != tip_en and "mparejar" in tip_es,
+          "the Smart Match tooltip is translated (es: %r)" % tip_es)
+    check(operator.description(bpy.context, None) == operator.bl_description
+          or tip_en == operator.description(bpy.context, None),
+          "...and the English one still matches the static fallback")
+    #  And the shared text that describes Maya's double-click tree is replaced
+    #  by wording that matches this panel.
+    check("doble click" not in desc_es.lower() and "reasignar" in desc_es.lower(),
+          "the Auto-Loader description describes Blender's own UI (es)")
+
     # ── The config's color_space is honored, not hardcoded ─────
     import json
     config_path = os.path.join(os.path.dirname(addon.__file__), "texture_autoloader_config.json")

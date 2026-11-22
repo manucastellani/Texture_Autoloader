@@ -2,42 +2,40 @@
 Minimal maya.cmds stub for running the Maya front-end's tests without
 Maya installed. Simulates only what's needed: shape/shading-engine/
 assigned-material lookups (for _get_assigned_material_name and the
-match_objects_to_textures wrapper), and records the scene-writing calls
-(nodes created, connections made, attributes set, warnings) so the wiring
-can be checked without a real Maya. The real network is also verified
-inside Maya by tests/run_in_mayapy.py.
+match_objects_to_textures wrapper), and records scene-writing calls
+(nodes created, connections, attributes set) so the render engine
+templates can be checked without the renderers installed.
 """
 
 _shape_connections = {}
 _sg_surface_shader = {}
 
 # Recorded scene writes.
-created = {}        # node name -> node type
-connections = []    # (source plug, destination plug)
-set_attrs = {}      # plug -> value
-warnings = []       # messages passed to cmds.warning
+_created = {}          # node name -> node type
+_connections = []      # (source plug, destination plug)
+_set_attrs = {}        # plug -> value (or tuple of values)
 
-# Attributes attributeQuery should report as missing, as (node type, attr).
-missing_attrs = set()
+# Knobs for tests.
+_warnings = []          # messages passed to cmds.warning
+_missing_attrs = set()  # (node type, attr) pairs attributeQuery reports as missing
+_loaded_plugins = None  # None = every plugin counts as loaded
 
 
 def reset():
+    global _loaded_plugins
     _shape_connections.clear()
     _sg_surface_shader.clear()
-    created.clear()
-    del connections[:]
-    set_attrs.clear()
-    del warnings[:]
-    missing_attrs.clear()
+    _created.clear()
+    del _connections[:]
+    _set_attrs.clear()
+    del _warnings[:]
+    _missing_attrs.clear()
+    _loaded_plugins = None
 
 
 def warning(msg):
-    warnings.append(msg)
+    _warnings.append(msg)
     print(f"[maya.cmds stub] WARNING: {msg}")
-
-
-def attributeQuery(attr, node=None, exists=False, **kwargs):
-    return (created.get(node, node), attr) not in missing_attrs
 
 
 def ls(selection=False, sl=False, **kwargs):
@@ -49,6 +47,8 @@ def listRelatives(obj, shapes=False, fullPath=False, **kwargs):
 
 
 def nodeType(node):
+    if node in _created:
+        return _created[node]
     return _shape_connections.get(node, {}).get("type", "mesh")
 
 
@@ -65,24 +65,36 @@ def listConnections(plug, type=None, **kwargs):
     return []
 
 
-def shadingNode(node_type, asUtility=False, asTexture=False, asShader=False, name=None,
-                **kwargs):
+def shadingNode(node_type, asUtility=False, asTexture=False, asShader=False, name=None, **kwargs):
     node = name or (node_type + "1")
-    created[node] = node_type
+    _created[node] = node_type
     return node
 
 
 def setAttr(plug, *values, **kwargs):
-    set_attrs[plug] = values[0] if len(values) == 1 else values
+    _set_attrs[plug] = values[0] if len(values) == 1 else values
 
 
 def connectAttr(source, destination, force=False, **kwargs):
-    connections.append((source, destination))
+    _connections.append((source, destination))
 
 
 def disconnectAttr(source, destination, **kwargs):
-    if (source, destination) in connections:
-        connections.remove((source, destination))
+    if (source, destination) in _connections:
+        _connections.remove((source, destination))
+
+
+def attributeQuery(attr, node=None, exists=False, **kwargs):
+    return (_created.get(node, node), attr) not in _missing_attrs
+
+
+def pluginInfo(plugin, query=False, loaded=False, **kwargs):
+    return _loaded_plugins is None or plugin in _loaded_plugins
+
+
+def loadPlugin(plugin, quiet=False, **kwargs):
+    if _loaded_plugins is not None:
+        _loaded_plugins.add(plugin)
 
 
 def sets(*args, **kwargs):
@@ -94,7 +106,7 @@ def objExists(node):
 
 
 def delete(node):
-    pass
+    _created.pop(node, None)
 
 
 def listHistory(node, pruneDagObjects=False):
