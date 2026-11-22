@@ -46,7 +46,6 @@ bl_info = {
 import os
 import re
 import json
-import glob
 import difflib
 import logging
 import logging.handlers
@@ -96,8 +95,10 @@ def get_logger() -> "logging.Logger":
     logger.propagate = False
     try:
         log_path = os.path.join(_app_dir(), LOG_FILENAME)
+        # delay=True: the file is created on the first message, so a folder
+        # that never logs anything isn't left with an empty .log.
         handler = logging.handlers.RotatingFileHandler(
-            log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+            log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8", delay=True)
         handler.setLevel(logging.DEBUG)
         handler.setFormatter(logging.Formatter(
             "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
@@ -406,8 +407,11 @@ if not HAS_RAPIDFUZZ:
 
 _EXTS = set(DEFAULT_CONFIG["texture_extensions"])
 
+# The separator includes the dot because Substance and Mari export UDIM tiles
+# as "Wall_BaseColor.1001.png": without it, every tile was grouped as its own
+# texture set and the UDIM never collapsed.
 _TRAILING_MOD = re.compile(
-    r'[_\-](opengl|directx|dx|gl|tangent|world|object|space|'
+    r'[._\-](opengl|directx|dx|gl|tangent|world|object|space|'
     r'1k|2k|4k|8k|hi|lo|hd|sd|udim|\d{4})$', re.I)
 
 _UDIM_RE = re.compile(r'^(?P<prefix>.*)(?P<sep>[._-])(?P<tile>1[0-9]{3})$')
@@ -462,15 +466,62 @@ def _material_base_name(material: str, mesh_prefixes: List[str]) -> str:
     return n.strip('-_')
 
 
-def _similarity(a: str, b: str) -> float:
-    a = a.lower().replace("_", "").replace("-", "").replace(" ", "")
-    b = b.lower().replace("_", "").replace("-", "").replace(" ", "")
+_WORD_SEP_RE = re.compile(r'[._\-\s]+')
+
+# Scores for the two kinds of evidence in _similarity. Full-word containment is
+# strong evidence (an artist's naming convention), a bare substring is weak.
+_WORD_MATCH_SCORE = 0.90
+_SUBSTRING_FLOOR = 0.60
+_SUBSTRING_RANGE = 0.30
+
+
+def _flat_name(name: str) -> str:
+    return _WORD_SEP_RE.sub('', name).lower()
+
+
+def _name_words(name: str) -> set:
+    return {w for w in _WORD_SEP_RE.split(name.lower()) if w}
+
+
+def _fuzzy_ratio(a: str, b: str) -> float:
     if HAS_RAPIDFUZZ:
-        score = _FUZZ.WRatio(a, b) / 100.0
-    else:
-        score = difflib.SequenceMatcher(None, a, b).ratio()
-    if a in b or b in a:
-        score = max(score, 0.85)
+        return _FUZZ.WRatio(a, b) / 100.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _similarity(a: str, b: str) -> float:
+    """
+    0..1 similarity between two names, tolerant of typos.
+
+    The number is read as confidence in the UI, so the kinds of evidence are
+    kept apart instead of collapsing into one flat bonus:
+
+      - same name ignoring separators and case -> 1.0
+      - every WORD of one name is a word of the other ("Cabeza" vs
+        "Modelado2_Cabeza") -> at least 0.90
+      - one name merely CONTAINS the other ("Boca" inside
+        "Modelado2_TornilloBoca") -> only in proportion to how much of the
+        longer name it covers
+
+    A flat 0.85 for any substring (what this used to do, and what rapidfuzz's
+    partial ratio does on its own) made a wrong match look as confident as a
+    right one and left the sensitivity slider with no effect between those
+    values. Anything that is neither of the above keeps the fuzzy ratio, which
+    is what catches typos ("brazos" vs "Braxos").
+    """
+    flat_a, flat_b = _flat_name(a), _flat_name(b)
+    if not flat_a or not flat_b:
+        return 0.0
+    if flat_a == flat_b:
+        return 1.0
+
+    score = _fuzzy_ratio(flat_a, flat_b)
+    words_a, words_b = _name_words(a), _name_words(b)
+    if words_a and words_b and (words_a <= words_b or words_b <= words_a):
+        return max(score, _WORD_MATCH_SCORE)
+    if flat_a in flat_b or flat_b in flat_a:
+        short, long = sorted((flat_a, flat_b), key=len)
+        return min(score, _SUBSTRING_FLOOR + _SUBSTRING_RANGE * (len(short) / len(long)))
     return score
 
 
@@ -491,13 +542,16 @@ def scan_texture_folder(folder: str, suffix_strip_list: List[str],
 
 def _compute_matches(obj_names: List[str], tex_bases: List[str],
                       threshold: float) -> List[Tuple[str, Optional[str], float]]:
+    # Ties are broken deterministically (fewest extra words, then shorter
+    # name, then alphabetically): taking the first candidate meant the winner
+    # depended on the order the folder happened to list the files in.
     results = []
     for obj_base in obj_names:
-        best_base, best_score = None, 0.0
-        for tb in tex_bases:
-            s = _similarity(obj_base, tb)
-            if s > best_score:
-                best_score, best_base = s, tb
+        ranked = sorted(
+            ((_similarity(obj_base, tb), len(_name_words(tb)), len(tb), tb.lower(), tb)
+             for tb in tex_bases),
+            key=lambda c: (-c[0], c[1], c[2], c[3]))
+        best_score, best_base = (ranked[0][0], ranked[0][4]) if ranked else (0.0, None)
         results.append((obj_base, best_base if best_score >= threshold else None, best_score))
     return results
 
@@ -698,12 +752,26 @@ def _socket(node: "bpy.types.Node", *names: str) -> Optional["bpy.types.NodeSock
 
 
 def _udim_tiles_from_disk(representative_path: str) -> Dict[int, str]:
-    pattern = representative_path.replace("<UDIM>", "[0-9][0-9][0-9][0-9]")
+    """{numero_de_tile: filepath} de los tiles que existen en disco.
+
+    El número se lee en la posición del token <UDIM>, no como "el primer grupo
+    de 4 dígitos del nombre": con eso, un asset como
+    "Crate2048_BaseColor.1001.png" se registraba como tile 2048."""
+    folder, fname = os.path.split(representative_path)
+    prefix, _sep, rest = fname.partition("<UDIM>")
+    ext = os.path.splitext(rest)[1]
     tiles: Dict[int, str] = {}
-    for fp in glob.glob(pattern):
-        m = re.search(r'(\d{4})', os.path.basename(fp))
-        if m:
-            tiles[int(m.group(1))] = fp
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return tiles
+    for name in names:
+        if not name.startswith(prefix) or not name.endswith(ext):
+            continue
+        stem = name[len(prefix):-len(ext)] if ext else name[len(prefix):]
+        digits = re.match(r'^(\d{4})', stem)
+        if digits:
+            tiles[int(digits.group(1))] = os.path.join(folder, name)
     return tiles
 
 
@@ -734,6 +802,40 @@ def _load_image(file_path: str, is_udim: bool, colorspace: str) -> Optional["bpy
     except RuntimeError as e:
         _warn(f"[TextureAutoloader] Could not load image '{file_path}': {e}")
         return None
+
+
+# El config comparte los nombres de color space con la versión de Maya, que
+# usa la nomenclatura de Arnold ("Raw"); Blender llama "Non-Color" a lo mismo.
+# Con esta tabla el valor del config se respeta — antes estaba hardcodeado acá
+# y la clave del config no hacía nada. Un valor que no esté en la tabla (un
+# OCIO propio del estudio) se pasa tal cual, y si Blender no lo reconoce,
+# _load_image avisa y deja el default.
+_COLORSPACE_ALIASES = {
+    "raw": "Non-Color",
+    "non-color": "Non-Color",
+    "noncolor": "Non-Color",
+    "srgb": "sRGB",
+}
+
+
+# Tipos de mapa que esta addon sabe cablear. Un `map_types` extendido a
+# mano en el config (algo que el README invita a hacer) puede traer ids que acá
+# no existen: antes se creaba el nodo de textura igual y quedaba suelto en la
+# escena, sin conexión y sin aviso. Ver process_textures.
+WIRED_MAP_TYPES = frozenset({
+    "baseColor", "roughness", "metallic", "normal", "emission", "ao",
+    "displacement", "opacity",
+})
+
+
+def _colorspace_for(map_id: str, config: Dict[str, Any], default: str) -> str:
+    """Color space del config para ese canal, traducido a como lo llama
+    Blender."""
+    for mt in config.get("map_types", []):
+        if mt.get("id") == map_id and mt.get("color_space"):
+            value = str(mt["color_space"]).strip()
+            return _COLORSPACE_ALIASES.get(value.lower(), value)
+    return default
 
 
 def _add_image_node(node_tree: "bpy.types.NodeTree", file_path: str, is_udim: bool,
@@ -794,6 +896,7 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
     ao_node = None
     y = 400
     skipped_displacement = 0
+    unsupported: List[str] = []
 
     for map_id, file_path in channel_files.items():
         is_udim = "<UDIM>" in file_path
@@ -803,7 +906,9 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
             continue
 
         if map_id == "baseColor":
-            node = _add_image_node(node_tree, file_path, is_udim, "sRGB", "Base Color", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "sRGB"), "Base Color", -400, y)
             if node:
                 base_color_node = node
                 socket = _socket(bsdf, "Base Color")
@@ -811,21 +916,27 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                     node_tree.links.new(node.outputs["Color"], socket)
 
         elif map_id == "roughness":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Roughness", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Roughness", -400, y)
             if node:
                 socket = _socket(bsdf, "Roughness")
                 if socket:
                     node_tree.links.new(node.outputs["Color"], socket)
 
         elif map_id == "metallic":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Metallic", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Metallic", -400, y)
             if node:
                 socket = _socket(bsdf, "Metallic")
                 if socket:
                     node_tree.links.new(node.outputs["Color"], socket)
 
         elif map_id == "normal":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Normal", -600, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Normal", -600, y)
             if node:
                 normal_map = node_tree.nodes.new("ShaderNodeNormalMap")
                 normal_map.location = (-350, y)
@@ -835,7 +946,9 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                     node_tree.links.new(normal_map.outputs["Normal"], socket)
 
         elif map_id == "emission":
-            node = _add_image_node(node_tree, file_path, is_udim, "sRGB", "Emission", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "sRGB"), "Emission", -400, y)
             if node:
                 color_socket = _socket(bsdf, "Emission Color", "Emission")
                 if color_socket:
@@ -845,10 +958,14 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                     strength_socket.default_value = 1.0
 
         elif map_id == "ao":
-            ao_node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "AO", -400, y)
+            ao_node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "AO", -400, y)
 
         elif map_id == "opacity":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Opacity", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Opacity", -400, y)
             if node:
                 socket = _socket(bsdf, "Alpha")
                 if socket:
@@ -859,12 +976,20 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
                     pass
 
         elif map_id == "displacement":
-            node = _add_image_node(node_tree, file_path, is_udim, "Non-Color", "Displacement", -400, y)
+            node = _add_image_node(
+                node_tree, file_path, is_udim,
+                _colorspace_for(map_id, config, "Non-Color"), "Displacement", -400, y)
             if node:
                 disp_node = node_tree.nodes.new("ShaderNodeDisplacement")
                 disp_node.location = (150, -300)
                 node_tree.links.new(node.outputs["Color"], disp_node.inputs["Height"])
                 node_tree.links.new(disp_node.outputs["Displacement"], output.inputs["Displacement"])
+
+        else:
+            # Un map type agregado a mano en el config (algo que el README
+            # invita a hacer): no hay regla para cablearlo, así que se avisa
+            # en vez de ignorarlo en silencio.
+            unsupported.append(map_id)
 
         y -= 260
 
@@ -882,6 +1007,13 @@ def process_textures(obj_name: str, mat_basename: str, channel_files: Dict[str, 
         base_socket = _socket(bsdf, "Base Color")
         if base_socket:
             node_tree.links.new(mix_node.outputs["Result"], base_socket)
+
+    if unsupported:
+        _warn(
+            f"[TextureAutoloader] map type(s) {', '.join(sorted(set(unsupported)))} come from "
+            f"texture_autoloader_config.json but this addon has no wiring rule for them, so "
+            f"they were NOT applied to {obj.name} (supported: "
+            f"{', '.join(sorted(WIRED_MAP_TYPES))}).")
 
     if skipped_displacement:
         _warn(
