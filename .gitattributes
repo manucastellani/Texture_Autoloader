@@ -1,0 +1,12 @@
+# Keep the working tree consistent across machines. Without this, git checks
+# the sources out with CRLF on Windows (core.autocrlf) and LF elsewhere, which
+# made `build_standalone.py --check` report a freshly generated file as out of
+# date: the generator's own text is LF, the file on disk was not.
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.gitattributes text eol=lf
+
+# Screenshots
+*.png binary
